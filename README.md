@@ -32,6 +32,76 @@ cargo run -p aigate-server
 # AIGate listening on http://0.0.0.0:8080
 ```
 
+## Quick reference
+
+The fast, complete contract — for humans skimming and agents integrating. Detail
+and examples for each item are in the sections further down.
+
+### Endpoints
+
+| Method & path              | Auth* | Purpose                                          |
+|----------------------------|-------|--------------------------------------------------|
+| `POST /v1/chat/completions`| yes   | Chat (stream/non-stream, tools, images, failover, cache) |
+| `GET  /v1/models`          | yes   | List models; optional `?provider=<name>`         |
+| `GET  /v1/usage`           | yes   | Usage/cost metrics + cache stats                 |
+| `GET  /health`             | no    | Liveness probe → `ok`                            |
+
+\* Auth is enforced only when `AIGATE_KEYS` is set; otherwise all routes are open.
+
+### Request headers
+
+| Header                         | When            | Meaning                                                        |
+|--------------------------------|-----------------|----------------------------------------------------------------|
+| `Content-Type: application/json` | POST           | Required for the chat endpoint.                                |
+| `Authorization: Bearer <key>`  | usually         | Provider API key; default key for every targeted engine.       |
+| `X-AI-Key-<Provider>: <key>`   | optional        | Per-engine provider key (e.g. `X-AI-Key-Claude`). Overrides the bearer for that engine — required for **cross-engine failover**. |
+| `X-AIGate-Key: <key>`          | if auth on      | Gateway key (separate from the provider key).                  |
+| `X-AI-Provider: <name>`        | optional        | Engine to use when `model` has no `provider/` prefix.          |
+| `X-AI-App: <name>`             | optional        | App label for usage metrics (ignored when auth is on — the key decides the identity). |
+| `X-AI-Cache: on \| <seconds> \| off` | optional  | Enable the response cache and set its TTL (`on` = 300s).       |
+| `X-AI-Retries: <1-10>`         | optional        | Per-target retry attempts (default 3).                         |
+
+A request needs **either** an `Authorization` bearer **or** an `X-AI-Key-<Provider>`
+for every engine it targets. Response header `X-AI-Cache: HIT|MISS` is set on
+non-streaming chat replies.
+
+### Environment variables (all optional)
+
+| Var                 | Default             | Meaning                                            |
+|---------------------|---------------------|----------------------------------------------------|
+| `AIGATE_KEYS`       | unset (auth off)    | `key:app,key:app,…` — enables gateway auth.         |
+| `AIGATE_RATE_LIMIT` | `0` (off)           | Requests/min per identity (token bucket).           |
+| `AIGATE_CACHE_MAX`  | `1000`              | Max cache entries (`0` = unbounded, LRU eviction).  |
+| `AIGATE_STATE_FILE` | `aigate-state.json` | Persistence path (`off`/`none` disables).           |
+| `AIGATE_FLUSH_SECS` | `15`                | Persistence flush interval (seconds).               |
+| `RUST_LOG`          | `aigate_server=info`| Tracing filter.                                     |
+
+### Model id & request body
+
+- **Model id**: `provider/model`, e.g. `openai/gpt-4o-mini`,
+  `gemini/gemini-2.0-flash`, `claude/claude-sonnet-4-5`,
+  `mistral/mistral-small-latest`. Aliases: `anthropic/`→claude, `google/`→gemini.
+- **Body** is the OpenAI chat-completions schema plus one extension:
+  `model`, `messages`, `stream`, `temperature`, `max_tokens`, `tools`,
+  `tool_choice`, and **`fallbacks`** (array of `provider/model`, AIGate-specific).
+- **Response** is the OpenAI `chat.completion` (or `chat.completion.chunk` SSE)
+  schema. Errors are `{"error": {"message": ..., "attempts"?: [...]}}`.
+
+### Using an existing OpenAI SDK
+
+Point any OpenAI client at the gateway and prefix the model:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="<your-provider-key>")
+client.chat.completions.create(
+    model="gemini/gemini-2.0-flash",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+---
+
 ## Call it
 
 The target engine is chosen by a `provider/model` prefix (or an `X-AI-Provider`
@@ -165,9 +235,9 @@ curl http://localhost:8080/v1/usage
 ```
 
 Cost uses a built-in price table (USD per 1M tokens, matched by model prefix);
-unpriced models still count tokens with `cost_usd` unchanged. Metrics are
-**ephemeral** — they reset when the daemon restarts. For streaming, usage is
-recorded from the final chunk that carries it (Claude streaming omits it).
+unpriced models still count tokens with `cost_usd` unchanged. Metrics **survive
+restarts** (see [Persistence](#persistence)). For streaming, usage is recorded
+from the final chunk that carries it (Claude streaming omits it).
 
 ## Gateway authentication
 
