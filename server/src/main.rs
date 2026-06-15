@@ -13,9 +13,10 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::{Json, Query},
+    extract::{Json, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -28,11 +29,41 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use aigate_core::{
-    chat_failover_with, resolve, split_model, stream_failover_with, Chunk, ChunkStream,
-    FailoverError, RetryPolicy, Target, UnifiedRequest, UnifiedResponse, PROVIDERS,
+    chat_failover_with, estimate_cost, resolve, split_model, stream_failover_with, Chunk,
+    ChunkStream, FailoverError, RetryPolicy, Target, UnifiedRequest, UnifiedResponse, Usage,
+    PROVIDERS,
 };
 
 type ApiError = (StatusCode, Json<Value>);
+
+// ── In-memory usage tracking ────────────────────────────────────────────
+// Ephemeral: aggregated per (app, provider, model); reset on restart.
+
+#[derive(Clone, Default)]
+struct AppState {
+    metrics: Arc<Mutex<Metrics>>,
+}
+
+#[derive(Default)]
+struct Metrics {
+    entries: HashMap<StatKey, Stat>,
+}
+
+#[derive(Hash, Eq, PartialEq, Clone)]
+struct StatKey {
+    app: String,
+    provider: String,
+    model: String,
+}
+
+#[derive(Default, Clone)]
+struct Stat {
+    requests: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    cost_usd: f64,
+}
 
 #[tokio::main]
 async fn main() {
@@ -43,10 +74,13 @@ async fn main() {
         )
         .init();
 
+    let state = AppState::default();
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat));
+        .route("/v1/usage", get(usage))
+        .route("/v1/chat/completions", post(chat))
+        .with_state(state);
 
     let addr = "0.0.0.0:8080";
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
@@ -99,7 +133,11 @@ async fn models(
     Ok(Json(json!({ "object": "list", "data": data })))
 }
 
-async fn chat(headers: HeaderMap, Json(body): Json<Value>) -> Result<Response, ApiError> {
+async fn chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, ApiError> {
     let req: UnifiedRequest = serde_json::from_value(body.clone())
         .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("invalid request: {e}")))?;
 
@@ -147,16 +185,54 @@ async fn chat(headers: HeaderMap, Json(body): Json<Value>) -> Result<Response, A
     }
 
     let policy = retry_policy(&headers);
+    let app = app_id(&headers);
 
     if req.stream {
         match stream_failover_with(targets, &req, &policy).await {
-            Ok((model, stream)) => Ok(sse_response(model, stream)),
+            Ok((provider, model, stream)) => {
+                Ok(sse_response(state, app, provider, model, stream))
+            }
             Err(fe) => Err(failover_error(fe, skipped)),
         }
     } else {
         match chat_failover_with(targets, &req, &policy).await {
-            Ok(resp) => Ok(completion_response(resp)),
+            Ok((provider, resp)) => {
+                record(&state, &app, &provider, &resp.model, resp.usage.as_ref());
+                Ok(completion_response(resp))
+            }
             Err(fe) => Err(failover_error(fe, skipped)),
+        }
+    }
+}
+
+/// The calling app's identity, from `X-AI-App` (defaults to "unknown").
+fn app_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-ai-app")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// Accumulate one request into the in-memory metrics.
+fn record(state: &AppState, app: &str, provider: &str, model: &str, usage: Option<&Usage>) {
+    let mut metrics = state.metrics.lock().unwrap();
+    let stat = metrics
+        .entries
+        .entry(StatKey {
+            app: app.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+        })
+        .or_default();
+    stat.requests += 1;
+    if let Some(u) = usage {
+        stat.prompt_tokens += u.prompt_tokens as u64;
+        stat.completion_tokens += u.completion_tokens as u64;
+        stat.total_tokens += u.total_tokens as u64;
+        if let Some(cost) = estimate_cost(provider, model, u) {
+            stat.cost_usd += cost;
         }
     }
 }
@@ -192,22 +268,85 @@ fn completion_response(resp: UnifiedResponse) -> Response {
     .into_response()
 }
 
-fn sse_response(model: String, upstream: ChunkStream) -> Response {
+fn sse_response(
+    state: AppState,
+    app: String,
+    provider: String,
+    model: String,
+    upstream: ChunkStream,
+) -> Response {
+    // Capture the usage carried by a late chunk so we can record it when the
+    // stream completes.
+    let captured: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
+    let cap = captured.clone();
+    let chunk_model = model.clone();
+
     let events = upstream
         .map(move |item| -> Result<Event, Infallible> {
             match item {
-                Ok(chunk) => Ok(Event::default().data(chunk_envelope(&model, &chunk).to_string())),
+                Ok(chunk) => {
+                    if let Some(u) = &chunk.usage {
+                        *cap.lock().unwrap() = Some(u.clone());
+                    }
+                    Ok(Event::default().data(chunk_envelope(&chunk_model, &chunk).to_string()))
+                }
                 Err(e) => Ok(Event::default()
                     .event("error")
                     .data(json!({ "error": { "message": e.to_string() } }).to_string())),
             }
         })
-        // OpenAI clients expect a terminal `data: [DONE]`.
-        .chain(futures::stream::once(async {
+        // Runs after all chunks are consumed: record usage, then emit [DONE].
+        .chain(futures::stream::once(async move {
+            let usage = captured.lock().unwrap().clone();
+            record(&state, &app, &provider, &model, usage.as_ref());
             Ok(Event::default().data("[DONE]"))
         }));
 
     Sse::new(events).keep_alive(KeepAlive::default()).into_response()
+}
+
+/// `GET /v1/usage` — aggregated token and cost metrics since startup.
+async fn usage(State(state): State<AppState>) -> Json<Value> {
+    let metrics = state.metrics.lock().unwrap();
+    let mut rows: Vec<(&StatKey, &Stat)> = metrics.entries.iter().collect();
+    rows.sort_by(|(a, _), (b, _)| {
+        (&a.app, &a.provider, &a.model).cmp(&(&b.app, &b.provider, &b.model))
+    });
+
+    let (mut t_req, mut t_prompt, mut t_compl, mut t_total, mut t_cost) = (0u64, 0u64, 0u64, 0u64, 0f64);
+    let mut by = Vec::new();
+    for (k, s) in rows {
+        t_req += s.requests;
+        t_prompt += s.prompt_tokens;
+        t_compl += s.completion_tokens;
+        t_total += s.total_tokens;
+        t_cost += s.cost_usd;
+        by.push(json!({
+            "app": k.app,
+            "provider": k.provider,
+            "model": k.model,
+            "requests": s.requests,
+            "prompt_tokens": s.prompt_tokens,
+            "completion_tokens": s.completion_tokens,
+            "total_tokens": s.total_tokens,
+            "cost_usd": round6(s.cost_usd),
+        }));
+    }
+
+    Json(json!({
+        "totals": {
+            "requests": t_req,
+            "prompt_tokens": t_prompt,
+            "completion_tokens": t_compl,
+            "total_tokens": t_total,
+            "cost_usd": round6(t_cost),
+        },
+        "by": by,
+    }))
+}
+
+fn round6(x: f64) -> f64 {
+    (x * 1e6).round() / 1e6
 }
 
 /// An OpenAI-compatible `chat.completion.chunk` envelope.

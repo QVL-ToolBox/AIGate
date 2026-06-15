@@ -97,20 +97,22 @@ fn decide(class: RetryClass, attempt: u32, policy: &RetryPolicy) -> Action {
     }
 }
 
-/// Non-streaming chat with default retry policy.
+/// Non-streaming chat with default retry policy. Returns the winning provider
+/// name alongside the response.
 pub async fn chat_failover(
     targets: Vec<Target>,
     base: &UnifiedRequest,
-) -> Result<UnifiedResponse, FailoverError> {
+) -> Result<(String, UnifiedResponse), FailoverError> {
     chat_failover_with(targets, base, &RetryPolicy::default()).await
 }
 
-/// Non-streaming chat with an explicit retry policy.
+/// Non-streaming chat with an explicit retry policy. Returns the winning
+/// provider name alongside the response.
 pub async fn chat_failover_with(
     targets: Vec<Target>,
     base: &UnifiedRequest,
     policy: &RetryPolicy,
-) -> Result<UnifiedResponse, FailoverError> {
+) -> Result<(String, UnifiedResponse), FailoverError> {
     let mut attempts = Vec::new();
     for target in targets {
         let mut req = base.clone();
@@ -120,7 +122,7 @@ pub async fn chat_failover_with(
         let mut tries = 0u32;
         loop {
             match target.provider.chat(&req, &target.key).await {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => return Ok((name.to_string(), resp)),
                 Err(e) => match decide(e.retry_class(), tries, policy) {
                     Action::Retry(delay) => {
                         tries += 1;
@@ -152,17 +154,17 @@ pub async fn chat_failover_with(
 pub async fn stream_failover(
     targets: Vec<Target>,
     base: &UnifiedRequest,
-) -> Result<(String, ChunkStream), FailoverError> {
+) -> Result<(String, String, ChunkStream), FailoverError> {
     stream_failover_with(targets, base, &RetryPolicy::default()).await
 }
 
-/// Streaming chat with an explicit retry policy. Returns the first stream that
-/// establishes, alongside the model that produced it.
+/// Streaming chat with an explicit retry policy. Returns the winning provider
+/// name and model alongside the first stream that establishes.
 pub async fn stream_failover_with(
     targets: Vec<Target>,
     base: &UnifiedRequest,
     policy: &RetryPolicy,
-) -> Result<(String, ChunkStream), FailoverError> {
+) -> Result<(String, String, ChunkStream), FailoverError> {
     let mut attempts = Vec::new();
     for target in targets {
         let mut req = base.clone();
@@ -172,7 +174,7 @@ pub async fn stream_failover_with(
         let mut tries = 0u32;
         loop {
             match target.provider.chat_stream(&req, &target.key).await {
-                Ok(stream) => return Ok((target.model, stream)),
+                Ok(stream) => return Ok((name.to_string(), target.model, stream)),
                 Err(e) => match decide(e.retry_class(), tries, policy) {
                     Action::Retry(delay) => {
                         tries += 1;

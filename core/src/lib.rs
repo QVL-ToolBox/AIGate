@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod failover;
+pub mod pricing;
 pub mod provider;
 pub mod providers;
 pub mod types;
@@ -15,6 +16,7 @@ pub use failover::{
     chat_failover, chat_failover_with, stream_failover, stream_failover_with, Attempt,
     FailoverError, RetryPolicy, Target,
 };
+pub use pricing::{estimate_cost, pricing, Pricing};
 pub use provider::{ChunkStream, Provider};
 pub use providers::{resolve, PROVIDERS};
 pub use types::{split_model, Chunk, Message, Role, UnifiedRequest, UnifiedResponse, Usage};

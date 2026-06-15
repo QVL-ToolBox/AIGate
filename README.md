@@ -67,6 +67,31 @@ Returns an OpenAI-compatible `{ "object": "list", "data": [...] }` where each
 available for an engine (bearer or `X-AI-Key-<provider>`), its live catalog is
 fetched; otherwise a built-in fallback catalog is returned (no key needed).
 
+## Usage & cost tracking
+
+Every **successful** request is aggregated in memory per `(app, provider,
+model)`. Identify the calling app with an `X-AI-App: <name>` header (defaults to
+`unknown`). Read the running totals:
+
+```bash
+curl http://localhost:8080/v1/usage
+```
+
+```json
+{
+  "totals": { "requests": 12, "prompt_tokens": 4200, "completion_tokens": 1800,
+              "total_tokens": 6000, "cost_usd": 0.0345 },
+  "by": [ { "app": "demo-app", "provider": "openai", "model": "gpt-4o-mini",
+            "requests": 12, "prompt_tokens": 4200, "completion_tokens": 1800,
+            "total_tokens": 6000, "cost_usd": 0.0345 } ]
+}
+```
+
+Cost uses a built-in price table (USD per 1M tokens, matched by model prefix);
+unpriced models still count tokens with `cost_usd` unchanged. Metrics are
+**ephemeral** — they reset when the daemon restarts. For streaming, usage is
+recorded from the final chunk that carries it (Claude streaming omits it).
+
 ## Supported engines
 
 | Provider | Prefix              | Auth                         |
@@ -135,7 +160,8 @@ header.
 - [x] **Provider failover / fallback** with per-engine keys
 - [x] **Smart retry policy** (transient retry + backoff, abort on client errors)
 - [x] **`/v1/models`** listing (live with key, built-in catalog without)
-- [ ] Token & cost tracking per app
+- [x] **Token & cost tracking** per app (`/v1/usage`, in-memory)
+- [ ] Persist usage metrics (currently reset on restart)
 - [ ] Tool calling and multimodal (lowest-common-denominator mapping)
 - [ ] Response caching
 
