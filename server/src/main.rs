@@ -48,6 +48,27 @@ struct AppState {
     cache: Arc<Mutex<Cache>>,
     /// Valid gateway keys -> app name. Empty disables auth.
     keys: Arc<HashMap<String, String>>,
+    rate: Arc<Mutex<RateLimiter>>,
+}
+
+// ── Per-identity token-bucket rate limiting ──────────────────────────────
+#[derive(Default)]
+struct RateLimiter {
+    /// Requests per minute; 0 disables limiting.
+    rpm: u32,
+    buckets: HashMap<String, Bucket>,
+}
+
+struct Bucket {
+    tokens: f64,
+    last_ms: u64,
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -101,14 +122,24 @@ async fn main() {
         )
         .init();
 
+    let rpm = load_rate_limit();
     let state = AppState {
         keys: Arc::new(load_keys()),
+        rate: Arc::new(Mutex::new(RateLimiter {
+            rpm,
+            buckets: HashMap::new(),
+        })),
         ..Default::default()
     };
     if state.keys.is_empty() {
         tracing::warn!("gateway auth DISABLED (set AIGATE_KEYS to require X-AIGate-Key)");
     } else {
         tracing::info!("gateway auth enabled: {} key(s)", state.keys.len());
+    }
+    if rpm == 0 {
+        tracing::warn!("rate limiting DISABLED (set AIGATE_RATE_LIMIT to requests/min)");
+    } else {
+        tracing::info!("rate limiting enabled: {rpm} req/min per identity");
     }
 
     let path = state_path();
@@ -151,7 +182,8 @@ async fn models(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
-    authenticate(&state, &headers)?;
+    let id = authenticate(&state, &headers)?.unwrap_or_else(|| app_id(&headers));
+    check_rate(&state, &id)?;
 
     let names: Vec<&str> = match params.get("provider") {
         Some(p) => {
@@ -195,6 +227,9 @@ async fn chat(
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
     let authed_app = authenticate(&state, &headers)?;
+    // Trust the key-derived app when auth is on; otherwise the X-AI-App header.
+    let app = authed_app.unwrap_or_else(|| app_id(&headers));
+    check_rate(&state, &app)?;
 
     let req: UnifiedRequest = serde_json::from_value(body.clone())
         .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("invalid request: {e}")))?;
@@ -243,8 +278,6 @@ async fn chat(
     }
 
     let policy = retry_policy(&headers);
-    // Trust the key-derived app when auth is on; otherwise the X-AI-App header.
-    let app = authed_app.unwrap_or_else(|| app_id(&headers));
 
     if req.stream {
         // Streaming responses are not cached.
@@ -374,6 +407,47 @@ fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Option<String>,
     }
 }
 
+/// Requests-per-minute limit from `AIGATE_RATE_LIMIT` (0/absent = disabled).
+fn load_rate_limit() -> u32 {
+    std::env::var("AIGATE_RATE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Token-bucket check for one identity. `Ok(())` to proceed, `Err(429)` when
+/// the bucket is empty (with a `retry_after` hint in the body).
+fn check_rate(state: &AppState, identity: &str) -> Result<(), ApiError> {
+    let mut rl = state.rate.lock().unwrap();
+    if rl.rpm == 0 {
+        return Ok(());
+    }
+    let capacity = rl.rpm as f64;
+    let per_ms = capacity / 60_000.0;
+    let now = now_millis();
+    let bucket = rl.buckets.entry(identity.to_string()).or_insert(Bucket {
+        tokens: capacity,
+        last_ms: now,
+    });
+    let elapsed = now.saturating_sub(bucket.last_ms) as f64;
+    bucket.tokens = (bucket.tokens + elapsed * per_ms).min(capacity);
+    bucket.last_ms = now;
+
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        Ok(())
+    } else {
+        let retry_after = ((1.0 - bucket.tokens) / per_ms / 1000.0).ceil() as u64;
+        Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": {
+                "message": "rate limit exceeded",
+                "retry_after": retry_after.max(1),
+            } })),
+        ))
+    }
+}
+
 /// The calling app's identity, from `X-AI-App` (defaults to "unknown").
 fn app_id(headers: &HeaderMap) -> String {
     headers
@@ -497,7 +571,8 @@ fn sse_response(
 
 /// `GET /v1/usage` — aggregated token and cost metrics since startup.
 async fn usage(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    authenticate(&state, &headers)?;
+    let id = authenticate(&state, &headers)?.unwrap_or_else(|| app_id(&headers));
+    check_rate(&state, &id)?;
 
     let metrics = state.metrics.lock().unwrap();
     let mut rows: Vec<(&StatKey, &Stat)> = metrics.entries.iter().collect();
@@ -880,6 +955,31 @@ mod tests {
         let mut good = HeaderMap::new();
         good.insert("x-aigate-key", HeaderValue::from_static("secret"));
         assert_eq!(authenticate(&secured, &good).unwrap(), Some("web".to_string()));
+    }
+
+    #[test]
+    fn rate_limit_allows_burst_then_blocks() {
+        let state = AppState {
+            rate: Arc::new(Mutex::new(RateLimiter {
+                rpm: 2,
+                buckets: HashMap::new(),
+            })),
+            ..Default::default()
+        };
+        assert!(check_rate(&state, "app").is_ok());
+        assert!(check_rate(&state, "app").is_ok());
+        let third = check_rate(&state, "app");
+        assert_eq!(third.unwrap_err().0, StatusCode::TOO_MANY_REQUESTS);
+        // A different identity has its own bucket.
+        assert!(check_rate(&state, "other").is_ok());
+    }
+
+    #[test]
+    fn rate_limit_disabled_when_zero() {
+        let state = AppState::default(); // rpm = 0
+        for _ in 0..50 {
+            assert!(check_rate(&state, "x").is_ok());
+        }
     }
 
     #[test]

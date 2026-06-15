@@ -191,6 +191,20 @@ When auth is on, the app identity for `/v1/usage` is taken from the **key**
 (trusted), not the self-declared `X-AI-App` header. Keys come from the
 environment and are never persisted.
 
+## Rate limiting
+
+Set `AIGATE_RATE_LIMIT` to a requests-per-minute cap, applied **per identity**
+(the authenticated app when auth is on, otherwise the `X-AI-App` header). It uses
+a token bucket — bursts up to the limit, then sustains `rpm`/min. `0`/absent
+disables it.
+
+```bash
+export AIGATE_RATE_LIMIT=60   # 60 req/min per app
+```
+
+Over the limit, `/v1/*` return `429` with a `retry_after` (seconds) hint.
+Buckets are in-memory and reset on restart.
+
 ## Persistence
 
 Usage metrics and the response cache are snapshotted to a JSON file so they
@@ -279,8 +293,8 @@ header.
 - [x] **Response cache** (opt-in, non-streaming)
 - [x] **Persistence** of metrics & cache (JSON snapshot, survives restart)
 - [x] **Gateway authentication** (per-app keys via `X-AIGate-Key`)
+- [x] **Rate limiting** per identity (token bucket, `AIGATE_RATE_LIMIT`)
 - [ ] Cache size bound / LRU eviction
-- [ ] Per-key rate limiting
 - [ ] Auto-fetch remote images to base64 for Gemini
 - [ ] Audio/document inputs
 
