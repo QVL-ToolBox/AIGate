@@ -139,8 +139,10 @@ curl -i http://localhost:8080/v1/chat/completions \
 ```
 
 Cache hits add **no** tokens or cost to `/v1/usage` (no upstream call) and are
-counted separately under `cache`. Caching is in-memory (reset on restart) and
-applies to **non-streaming** requests only.
+counted separately under `cache` (`hits`/`misses`/`entries`/`capacity`). Caching
+is in-memory and applies to **non-streaming** requests only. The entry count is
+bounded by `AIGATE_CACHE_MAX` (default 1000; `0` = unbounded) with **LRU
+eviction** — expired entries are dropped first, then the least-recently-used.
 
 ## Usage & cost tracking
 
@@ -294,7 +296,7 @@ header.
 - [x] **Persistence** of metrics & cache (JSON snapshot, survives restart)
 - [x] **Gateway authentication** (per-app keys via `X-AIGate-Key`)
 - [x] **Rate limiting** per identity (token bucket, `AIGATE_RATE_LIMIT`)
-- [ ] Cache size bound / LRU eviction
+- [x] **Cache bound + LRU eviction** (`AIGATE_CACHE_MAX`)
 - [ ] Auto-fetch remote images to base64 for Gemini
 - [ ] Audio/document inputs
 

@@ -82,12 +82,18 @@ struct Cache {
     entries: HashMap<String, CacheEntry>,
     hits: u64,
     misses: u64,
+    /// Max entries; 0 = unbounded.
+    capacity: usize,
+    /// Monotonic access counter for LRU ordering.
+    tick: u64,
 }
 
 struct CacheEntry {
     response: UnifiedResponse,
     /// Unix epoch seconds at which this entry expires (portable across restarts).
     expires_at: u64,
+    /// Access tick for LRU eviction (runtime-only, not persisted).
+    last_used: u64,
 }
 
 fn now_unix() -> u64 {
@@ -128,6 +134,10 @@ async fn main() {
         rate: Arc::new(Mutex::new(RateLimiter {
             rpm,
             buckets: HashMap::new(),
+        })),
+        cache: Arc::new(Mutex::new(Cache {
+            capacity: load_cache_max(),
+            ..Default::default()
         })),
         ..Default::default()
     };
@@ -346,11 +356,16 @@ fn cache_key_of(targets: &[Target], req: &UnifiedRequest) -> String {
 fn cache_get(state: &AppState, key: &str) -> Option<UnifiedResponse> {
     let mut cache = state.cache.lock().unwrap();
     let now = now_unix();
-    let hit = match cache.entries.get(key) {
-        Some(e) if e.expires_at > now => Some(e.response.clone()),
+    let tick = cache.tick + 1;
+    let hit = match cache.entries.get_mut(key) {
+        Some(e) if e.expires_at > now => {
+            e.last_used = tick; // LRU touch
+            Some(e.response.clone())
+        }
         _ => None,
     };
     if hit.is_some() {
+        cache.tick = tick;
         cache.hits += 1;
     } else {
         cache.entries.remove(key);
@@ -361,13 +376,39 @@ fn cache_get(state: &AppState, key: &str) -> Option<UnifiedResponse> {
 
 fn cache_put(state: &AppState, key: String, resp: &UnifiedResponse, ttl: Duration) {
     let mut cache = state.cache.lock().unwrap();
+    cache.tick += 1;
+    let last_used = cache.tick;
     cache.entries.insert(
         key,
         CacheEntry {
             response: resp.clone(),
             expires_at: now_unix() + ttl.as_secs(),
+            last_used,
         },
     );
+    enforce_capacity(&mut cache);
+}
+
+/// Drop expired entries, then evict least-recently-used ones until within cap.
+fn enforce_capacity(cache: &mut Cache) {
+    if cache.capacity == 0 || cache.entries.len() <= cache.capacity {
+        return;
+    }
+    let now = now_unix();
+    cache.entries.retain(|_, e| e.expires_at > now);
+    while cache.entries.len() > cache.capacity {
+        let lru = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(k, _)| k.clone());
+        match lru {
+            Some(k) => {
+                cache.entries.remove(&k);
+            }
+            None => break,
+        }
+    }
 }
 
 /// Parse `AIGATE_KEYS` (`key:app,key:app,...`) into a key -> app map.
@@ -614,6 +655,7 @@ async fn usage(State(state): State<AppState>, headers: HeaderMap) -> Result<Json
             "hits": cache.hits,
             "misses": cache.misses,
             "entries": cache.entries.len(),
+            "capacity": cache.capacity,
         },
         "by": by,
     })))
@@ -742,6 +784,14 @@ struct CacheRow {
     response: UnifiedResponse,
 }
 
+/// Max cache entries from `AIGATE_CACHE_MAX` (default 1000; 0 = unbounded).
+fn load_cache_max() -> usize {
+    std::env::var("AIGATE_CACHE_MAX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1000)
+}
+
 /// Where to persist state. `AIGATE_STATE_FILE` overrides the default; set it to
 /// `off`/`none`/empty to disable persistence.
 fn state_path() -> Option<PathBuf> {
@@ -814,15 +864,20 @@ fn apply_snapshot(state: &AppState, snap: Snapshot) {
         for r in snap.cache {
             // Drop entries that already expired while we were down.
             if r.expires_at > now {
+                cache.tick += 1;
+                let last_used = cache.tick;
                 cache.entries.insert(
                     r.key,
                     CacheEntry {
                         response: r.response,
                         expires_at: r.expires_at,
+                        last_used,
                     },
                 );
             }
         }
+        // Honor the capacity in case the file holds more than the current cap.
+        enforce_capacity(&mut cache);
     }
 }
 
@@ -980,6 +1035,35 @@ mod tests {
         for _ in 0..50 {
             assert!(check_rate(&state, "x").is_ok());
         }
+    }
+
+    #[test]
+    fn cache_evicts_least_recently_used() {
+        let state = AppState {
+            cache: Arc::new(Mutex::new(Cache {
+                capacity: 2,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let r = UnifiedResponse {
+            content: "x".into(),
+            tool_calls: None,
+            model: "m".into(),
+            finish_reason: None,
+            usage: None,
+        };
+        cache_put(&state, "k1".into(), &r, Duration::from_secs(300));
+        cache_put(&state, "k2".into(), &r, Duration::from_secs(300));
+        // Touch k1 so k2 becomes the least-recently-used.
+        assert!(cache_get(&state, "k1").is_some());
+        cache_put(&state, "k3".into(), &r, Duration::from_secs(300));
+
+        let cache = state.cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.entries.contains_key("k1"));
+        assert!(cache.entries.contains_key("k3"));
+        assert!(!cache.entries.contains_key("k2"), "k2 was LRU, evicted");
     }
 
     #[test]
