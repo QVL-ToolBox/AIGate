@@ -79,10 +79,35 @@ curl -N http://localhost:8080/v1/chat/completions \
         "messages": [{ "role": "user", "content": "Count to 5" }] }'
 ```
 
+## Failover
+
+Add a `fallbacks` array of further `provider/model` targets; they are tried in
+order when the primary fails (works for both streaming and non-streaming).
+Because each engine has its own key, supply a per-engine key with
+`X-AI-Key-<provider>` — the `Authorization` bearer is the default when no
+engine-specific header is present.
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "X-AI-Key-Claude: $ANTHROPIC_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-4o-mini",
+    "fallbacks": ["claude/claude-sonnet-4-6"],
+    "messages": [{ "role": "user", "content": "Hello" }]
+  }'
+```
+
+If every target fails, the response is `502` with an `attempts` array detailing
+each provider's error. For streaming, failover covers stream *establishment*; an
+error after the first bytes are sent surfaces as-is.
+
 ## Roadmap
 
 - [x] **Streaming** (SSE token-by-token) across all four engines
-- [ ] Provider failover / fallback
+- [x] **Provider failover / fallback** with per-engine keys
+- [ ] Smarter retry policy (only retry on 429 / 5xx / transport)
 - [ ] `/v1/models` listing
 - [ ] Token & cost tracking per app
 - [ ] Tool calling and multimodal (lowest-common-denominator mapping)

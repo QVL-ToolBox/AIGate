@@ -3,8 +3,13 @@
 //! Exposes an OpenAI-compatible surface so any existing SDK can plug in by
 //! changing only its base URL. The target engine is selected by a
 //! `provider/model` prefix (e.g. `gemini/gemini-2.0-flash`) or an
-//! `X-AI-Provider` header. The caller's API key (`Authorization: Bearer ...`)
-//! is forwarded per request and never stored.
+//! `X-AI-Provider` header.
+//!
+//! Failover: the request may carry a `fallbacks` array of further
+//! `provider/model` specs, tried in order if the primary fails. API keys are
+//! forwarded per request and never stored — the `Authorization` bearer is the
+//! default key, and a per-engine key can be supplied via `X-AI-Key-<provider>`
+//! (e.g. `X-AI-Key-Claude`).
 
 use std::convert::Infallible;
 
@@ -21,7 +26,10 @@ use axum::{
 use futures::StreamExt;
 use serde_json::{json, Value};
 
-use aigate_core::{resolve, split_model, Chunk, Provider, UnifiedRequest};
+use aigate_core::{
+    chat_failover, resolve, split_model, stream_failover, Chunk, ChunkStream, FailoverError,
+    Target, UnifiedRequest, UnifiedResponse,
+};
 
 type ApiError = (StatusCode, Json<Value>);
 
@@ -44,50 +52,68 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
-async fn chat(headers: HeaderMap, Json(mut req): Json<UnifiedRequest>) -> Result<Response, ApiError> {
-    let key = bearer(&headers)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing 'Authorization: Bearer <key>'"))?;
+async fn chat(headers: HeaderMap, Json(body): Json<Value>) -> Result<Response, ApiError> {
+    let req: UnifiedRequest = serde_json::from_value(body.clone())
+        .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("invalid request: {e}")))?;
 
-    // Provider from the model prefix, falling back to the X-AI-Provider header.
-    let (prefix, model) = split_model(&req.model);
-    let provider_name = prefix
-        .map(str::to_string)
-        .or_else(|| {
+    // Chain = primary (req.model) followed by any `fallbacks` specs.
+    let mut chain = vec![req.model.clone()];
+    if let Some(fbs) = body.get("fallbacks").and_then(Value::as_array) {
+        chain.extend(fbs.iter().filter_map(|v| v.as_str().map(str::to_string)));
+    }
+
+    // Build usable targets; record why any spec was skipped.
+    let mut targets = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for spec in &chain {
+        let (prefix, model) = split_model(spec);
+        let provider_name = prefix.map(str::to_string).or_else(|| {
             headers
                 .get("x-ai-provider")
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
-        })
-        .ok_or_else(|| {
-            err(
-                StatusCode::BAD_REQUEST,
-                "no provider: use 'provider/model' or the X-AI-Provider header",
-            )
-        })?;
-    req.model = model.to_string();
+        });
+        let Some(provider_name) = provider_name else {
+            skipped.push(json!({ "target": spec, "error": "no provider: use 'provider/model' or X-AI-Provider" }));
+            continue;
+        };
+        let Some(provider) = resolve(&provider_name) else {
+            skipped.push(json!({ "target": spec, "error": format!("unknown provider: {provider_name}") }));
+            continue;
+        };
+        let Some(key) = key_for(&provider_name, &headers) else {
+            skipped.push(json!({ "target": spec, "error": format!("no API key for '{provider_name}' (set Authorization bearer or X-AI-Key-{provider_name})") }));
+            continue;
+        };
+        targets.push(Target {
+            provider,
+            model: model.to_string(),
+            key,
+        });
+    }
 
-    let provider = resolve(&provider_name)
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, &format!("unknown provider: {provider_name}")))?;
+    if targets.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": { "message": "no usable target", "attempts": skipped } })),
+        ));
+    }
 
     if req.stream {
-        stream_chat(provider, req, key).await
+        match stream_failover(targets, &req).await {
+            Ok((model, stream)) => Ok(sse_response(model, stream)),
+            Err(fe) => Err(failover_error(fe, skipped)),
+        }
     } else {
-        complete_chat(provider, req, key).await
+        match chat_failover(targets, &req).await {
+            Ok(resp) => Ok(completion_response(resp)),
+            Err(fe) => Err(failover_error(fe, skipped)),
+        }
     }
 }
 
-async fn complete_chat(
-    provider: Box<dyn Provider>,
-    req: UnifiedRequest,
-    key: String,
-) -> Result<Response, ApiError> {
-    let resp = provider
-        .chat(&req, &key)
-        .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
-
-    // OpenAI-compatible response envelope.
-    Ok(Json(json!({
+fn completion_response(resp: UnifiedResponse) -> Response {
+    Json(json!({
         "object": "chat.completion",
         "model": resp.model,
         "choices": [{
@@ -101,20 +127,10 @@ async fn complete_chat(
             "total_tokens": u.total_tokens,
         })),
     }))
-    .into_response())
+    .into_response()
 }
 
-async fn stream_chat(
-    provider: Box<dyn Provider>,
-    req: UnifiedRequest,
-    key: String,
-) -> Result<Response, ApiError> {
-    let upstream = provider
-        .chat_stream(&req, &key)
-        .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
-
-    let model = req.model.clone();
+fn sse_response(model: String, upstream: ChunkStream) -> Response {
     let events = upstream
         .map(move |item| -> Result<Event, Infallible> {
             match item {
@@ -129,7 +145,7 @@ async fn stream_chat(
             Ok(Event::default().data("[DONE]"))
         }));
 
-    Ok(Sse::new(events).keep_alive(KeepAlive::default()).into_response())
+    Sse::new(events).keep_alive(KeepAlive::default()).into_response()
 }
 
 /// An OpenAI-compatible `chat.completion.chunk` envelope.
@@ -148,6 +164,28 @@ fn chunk_envelope(model: &str, chunk: &Chunk) -> Value {
             "total_tokens": u.total_tokens,
         })),
     })
+}
+
+/// Combine config-time skips and runtime attempts into one 502 payload.
+fn failover_error(fe: FailoverError, skipped: Vec<Value>) -> ApiError {
+    let mut attempts = skipped;
+    attempts.extend(fe.attempts.into_iter().map(|a| {
+        json!({ "provider": a.provider, "model": a.model, "error": a.error })
+    }));
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({ "error": { "message": "all providers failed", "attempts": attempts } })),
+    )
+}
+
+/// Resolve the key for a provider: a per-engine `X-AI-Key-<provider>` header
+/// if present, otherwise the `Authorization` bearer token.
+fn key_for(provider: &str, headers: &HeaderMap) -> Option<String> {
+    let header_name = format!("x-ai-key-{}", provider.to_ascii_lowercase());
+    if let Some(v) = headers.get(header_name.as_str()).and_then(|v| v.to_str().ok()) {
+        return Some(v.to_string());
+    }
+    bearer(headers)
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {
