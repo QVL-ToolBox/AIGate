@@ -13,4 +13,5 @@ async-trait = "0.1"
 thiserror = "1"
 futures = "0.3"
 eventsource-stream = "0.2"
+tokio = { version = "1", features = ["time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

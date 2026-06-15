@@ -100,14 +100,28 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 If every target fails, the response is `502` with an `attempts` array detailing
-each provider's error. For streaming, failover covers stream *establishment*; an
-error after the first bytes are sent surfaces as-is.
+each provider's error and how many `tries` it took. For streaming, failover
+covers stream *establishment*; an error after the first bytes are sent surfaces
+as-is.
+
+## Retry policy
+
+Errors are classified to avoid both wasted retries and pointless failover:
+
+| Class       | Examples                          | Behaviour                                   |
+|-------------|-----------------------------------|---------------------------------------------|
+| Transient   | 429, 5xx, 408/409/425, network    | retry **same** target (exp. backoff), then fail over |
+| Failover    | 401, 403, 404, empty, unsupported | skip to the **next** target (no same-target retry)   |
+| Abort       | 400, 422 (malformed request)      | **stop** the chain → `400` (no target would accept it) |
+
+Per-target attempts default to 3; override with the `X-AI-Retries: <1-10>`
+header.
 
 ## Roadmap
 
 - [x] **Streaming** (SSE token-by-token) across all four engines
 - [x] **Provider failover / fallback** with per-engine keys
-- [ ] Smarter retry policy (only retry on 429 / 5xx / transport)
+- [x] **Smart retry policy** (transient retry + backoff, abort on client errors)
 - [ ] `/v1/models` listing
 - [ ] Token & cost tracking per app
 - [ ] Tool calling and multimodal (lowest-common-denominator mapping)

@@ -27,8 +27,8 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 
 use aigate_core::{
-    chat_failover, resolve, split_model, stream_failover, Chunk, ChunkStream, FailoverError,
-    Target, UnifiedRequest, UnifiedResponse,
+    chat_failover_with, resolve, split_model, stream_failover_with, Chunk, ChunkStream,
+    FailoverError, RetryPolicy, Target, UnifiedRequest, UnifiedResponse,
 };
 
 type ApiError = (StatusCode, Json<Value>);
@@ -99,17 +99,32 @@ async fn chat(headers: HeaderMap, Json(body): Json<Value>) -> Result<Response, A
         ));
     }
 
+    let policy = retry_policy(&headers);
+
     if req.stream {
-        match stream_failover(targets, &req).await {
+        match stream_failover_with(targets, &req, &policy).await {
             Ok((model, stream)) => Ok(sse_response(model, stream)),
             Err(fe) => Err(failover_error(fe, skipped)),
         }
     } else {
-        match chat_failover(targets, &req).await {
+        match chat_failover_with(targets, &req, &policy).await {
             Ok(resp) => Ok(completion_response(resp)),
             Err(fe) => Err(failover_error(fe, skipped)),
         }
     }
+}
+
+/// Build the retry policy, allowing `X-AI-Retries` to override max attempts.
+fn retry_policy(headers: &HeaderMap) -> RetryPolicy {
+    let mut policy = RetryPolicy::default();
+    if let Some(n) = headers
+        .get("x-ai-retries")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        policy.max_attempts = n.clamp(1, 10);
+    }
+    policy
 }
 
 fn completion_response(resp: UnifiedResponse) -> Response {
@@ -166,15 +181,21 @@ fn chunk_envelope(model: &str, chunk: &Chunk) -> Value {
     })
 }
 
-/// Combine config-time skips and runtime attempts into one 502 payload.
+/// Combine config-time skips and runtime attempts into one error payload.
+/// An aborted chain (non-retriable client error) maps to 400; otherwise 502.
 fn failover_error(fe: FailoverError, skipped: Vec<Value>) -> ApiError {
+    let (status, message) = if fe.aborted {
+        (StatusCode::BAD_REQUEST, "request rejected (not retriable)")
+    } else {
+        (StatusCode::BAD_GATEWAY, "all providers failed")
+    };
     let mut attempts = skipped;
     attempts.extend(fe.attempts.into_iter().map(|a| {
-        json!({ "provider": a.provider, "model": a.model, "error": a.error })
+        json!({ "provider": a.provider, "model": a.model, "tries": a.tries, "error": a.error })
     }));
     (
-        StatusCode::BAD_GATEWAY,
-        Json(json!({ "error": { "message": "all providers failed", "attempts": attempts } })),
+        status,
+        Json(json!({ "error": { "message": message, "attempts": attempts } })),
     )
 }
 

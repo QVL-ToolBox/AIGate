@@ -10,8 +10,11 @@ pub mod provider;
 pub mod providers;
 pub mod types;
 
-pub use error::AiError;
-pub use failover::{chat_failover, stream_failover, Attempt, FailoverError, Target};
+pub use error::{AiError, RetryClass};
+pub use failover::{
+    chat_failover, chat_failover_with, stream_failover, stream_failover_with, Attempt,
+    FailoverError, RetryPolicy, Target,
+};
 pub use provider::{ChunkStream, Provider};
 pub use providers::resolve;
 pub use types::{split_model, Chunk, Message, Role, UnifiedRequest, UnifiedResponse, Usage};
