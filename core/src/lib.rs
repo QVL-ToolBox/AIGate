@@ -16,5 +16,5 @@ pub use failover::{
     FailoverError, RetryPolicy, Target,
 };
 pub use provider::{ChunkStream, Provider};
-pub use providers::resolve;
+pub use providers::{resolve, PROVIDERS};
 pub use types::{split_model, Chunk, Message, Role, UnifiedRequest, UnifiedResponse, Usage};

@@ -82,6 +82,23 @@ struct StopDelta {
     stop_reason: Option<String>,
 }
 
+const CLAUDE_MODELS: &[&str] = &[
+    "claude-opus-4-1",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+    "claude-3-5-haiku-latest",
+];
+
+#[derive(Deserialize)]
+struct ModelsResp {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
 impl Claude {
     /// Split the unified messages into Anthropic's `system` + `messages` shape.
     fn build<'a>(req: &'a UnifiedRequest, stream: bool) -> ChatReq<'a> {
@@ -190,5 +207,22 @@ impl Provider for Claude {
             .filter_map(|r| async move { r.transpose() });
 
         Ok(stream.boxed())
+    }
+
+    fn catalog(&self) -> Vec<String> {
+        CLAUDE_MODELS.iter().map(|s| s.to_string()).collect()
+    }
+
+    async fn list_models(&self, key: &str) -> Result<Vec<String>, AiError> {
+        let resp = self
+            .client
+            .get("https://api.anthropic.com/v1/models")
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await?;
+        let resp = super::ensure_ok(resp).await?;
+        let parsed: ModelsResp = resp.json().await?;
+        Ok(parsed.data.into_iter().map(|m| m.id).collect())
     }
 }

@@ -11,10 +11,11 @@
 //! default key, and a per-engine key can be supplied via `X-AI-Key-<provider>`
 //! (e.g. `X-AI-Key-Claude`).
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 
 use axum::{
-    extract::Json,
+    extract::{Json, Query},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -28,7 +29,7 @@ use serde_json::{json, Value};
 
 use aigate_core::{
     chat_failover_with, resolve, split_model, stream_failover_with, Chunk, ChunkStream,
-    FailoverError, RetryPolicy, Target, UnifiedRequest, UnifiedResponse,
+    FailoverError, RetryPolicy, Target, UnifiedRequest, UnifiedResponse, PROVIDERS,
 };
 
 type ApiError = (StatusCode, Json<Value>);
@@ -44,12 +45,58 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat));
 
     let addr = "0.0.0.0:8080";
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     tracing::info!("AIGate listening on http://{addr}");
     axum::serve(listener, app).await.expect("serve");
+}
+
+/// `GET /v1/models` — OpenAI-compatible model listing aggregated across
+/// engines. Model ids are prefixed `provider/model` so they can be passed
+/// straight back to `/v1/chat/completions`. When a key is available for an
+/// engine (bearer or `X-AI-Key-<provider>`) the live list is fetched; otherwise
+/// the built-in catalog is returned. Filter to one engine with `?provider=`.
+async fn models(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    let names: Vec<&str> = match params.get("provider") {
+        Some(p) => {
+            let p = p.as_str();
+            if resolve(p).is_none() {
+                return Err(err(StatusCode::BAD_REQUEST, &format!("unknown provider: {p}")));
+            }
+            vec![p]
+        }
+        None => PROVIDERS.to_vec(),
+    };
+
+    let mut data = Vec::new();
+    for name in names {
+        let Some(provider) = resolve(name) else {
+            continue;
+        };
+        let models = match key_for(name, &headers) {
+            // Live listing, falling back to the built-in catalog on any error.
+            Some(key) => provider
+                .list_models(&key)
+                .await
+                .unwrap_or_else(|_| provider.catalog()),
+            None => provider.catalog(),
+        };
+        for model in models {
+            data.push(json!({
+                "id": format!("{}/{}", provider.name(), model),
+                "object": "model",
+                "owned_by": provider.name(),
+            }));
+        }
+    }
+
+    Ok(Json(json!({ "object": "list", "data": data })))
 }
 
 async fn chat(headers: HeaderMap, Json(body): Json<Value>) -> Result<Response, ApiError> {

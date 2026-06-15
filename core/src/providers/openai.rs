@@ -16,7 +16,16 @@ pub struct OpenAiCompatible {
     name: &'static str,
     /// OpenAI accepts `stream_options.include_usage`; Mistral does not.
     stream_usage: bool,
+    /// Built-in fallback catalog (used when no key is available).
+    catalog: &'static [&'static str],
 }
+
+const OPENAI_MODELS: &[&str] = &["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o3", "o4-mini"];
+const MISTRAL_MODELS: &[&str] = &[
+    "mistral-large-latest",
+    "mistral-small-latest",
+    "open-mistral-nemo",
+];
 
 pub fn openai() -> OpenAiCompatible {
     OpenAiCompatible {
@@ -24,6 +33,7 @@ pub fn openai() -> OpenAiCompatible {
         base: "https://api.openai.com/v1".to_string(),
         name: "openai",
         stream_usage: true,
+        catalog: OPENAI_MODELS,
     }
 }
 
@@ -33,6 +43,7 @@ pub fn mistral() -> OpenAiCompatible {
         base: "https://api.mistral.ai/v1".to_string(),
         name: "mistral",
         stream_usage: false,
+        catalog: MISTRAL_MODELS,
     }
 }
 
@@ -102,6 +113,16 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ModelsResp {
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
 }
 
 impl RawUsage {
@@ -198,5 +219,21 @@ impl Provider for OpenAiCompatible {
             .filter_map(|r| async move { r.transpose() });
 
         Ok(stream.boxed())
+    }
+
+    fn catalog(&self) -> Vec<String> {
+        self.catalog.iter().map(|s| s.to_string()).collect()
+    }
+
+    async fn list_models(&self, key: &str) -> Result<Vec<String>, AiError> {
+        let resp = self
+            .client
+            .get(format!("{}/models", self.base))
+            .bearer_auth(key)
+            .send()
+            .await?;
+        let resp = super::ensure_ok(resp).await?;
+        let parsed: ModelsResp = resp.json().await?;
+        Ok(parsed.data.into_iter().map(|m| m.id).collect())
     }
 }

@@ -78,6 +78,25 @@ struct UsageMeta {
     total_token_count: u32,
 }
 
+const GEMINI_MODELS: &[&str] = &[
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+];
+
+#[derive(Deserialize)]
+struct ModelsResp {
+    #[serde(default)]
+    models: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    /// Fully qualified, e.g. `models/gemini-2.0-flash`.
+    name: String,
+}
+
 impl UsageMeta {
     fn into_usage(self) -> Usage {
         Usage {
@@ -209,5 +228,25 @@ impl Provider for Gemini {
             .filter_map(|r| async move { r.transpose() });
 
         Ok(stream.boxed())
+    }
+
+    fn catalog(&self) -> Vec<String> {
+        GEMINI_MODELS.iter().map(|s| s.to_string()).collect()
+    }
+
+    async fn list_models(&self, key: &str) -> Result<Vec<String>, AiError> {
+        let resp = self
+            .client
+            .get("https://generativelanguage.googleapis.com/v1beta/models")
+            .query(&[("key", key)])
+            .send()
+            .await?;
+        let resp = super::ensure_ok(resp).await?;
+        let parsed: ModelsResp = resp.json().await?;
+        Ok(parsed
+            .models
+            .into_iter()
+            .map(|m| m.name.strip_prefix("models/").unwrap_or(&m.name).to_string())
+            .collect())
     }
 }

@@ -55,6 +55,18 @@ Switch engine by changing the prefix and the key:
 -d '{ "model": "mistral/mistral-large-latest", "messages": [...] }'
 ```
 
+## List models
+
+```bash
+curl http://localhost:8080/v1/models                      # all engines, prefixed ids
+curl http://localhost:8080/v1/models?provider=claude      # filter to one engine
+```
+
+Returns an OpenAI-compatible `{ "object": "list", "data": [...] }` where each
+`id` is `provider/model` — ready to drop straight into `model`. When a key is
+available for an engine (bearer or `X-AI-Key-<provider>`), its live catalog is
+fetched; otherwise a built-in fallback catalog is returned (no key needed).
+
 ## Supported engines
 
 | Provider | Prefix              | Auth                         |
@@ -122,7 +134,7 @@ header.
 - [x] **Streaming** (SSE token-by-token) across all four engines
 - [x] **Provider failover / fallback** with per-engine keys
 - [x] **Smart retry policy** (transient retry + backoff, abort on client errors)
-- [ ] `/v1/models` listing
+- [x] **`/v1/models`** listing (live with key, built-in catalog without)
 - [ ] Token & cost tracking per app
 - [ ] Tool calling and multimodal (lowest-common-denominator mapping)
 - [ ] Response caching
