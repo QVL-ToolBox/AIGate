@@ -14,10 +14,11 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{Json, Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    http::{header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -42,11 +43,25 @@ type ApiError = (StatusCode, Json<Value>);
 #[derive(Clone, Default)]
 struct AppState {
     metrics: Arc<Mutex<Metrics>>,
+    cache: Arc<Mutex<Cache>>,
 }
 
 #[derive(Default)]
 struct Metrics {
     entries: HashMap<StatKey, Stat>,
+}
+
+// ── Opt-in, in-memory response cache (non-streaming only) ────────────────
+#[derive(Default)]
+struct Cache {
+    entries: HashMap<String, CacheEntry>,
+    hits: u64,
+    misses: u64,
+}
+
+struct CacheEntry {
+    response: UnifiedResponse,
+    expires_at: Instant,
 }
 
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -188,6 +203,7 @@ async fn chat(
     let app = app_id(&headers);
 
     if req.stream {
+        // Streaming responses are not cached.
         match stream_failover_with(targets, &req, &policy).await {
             Ok((provider, model, stream)) => {
                 Ok(sse_response(state, app, provider, model, stream))
@@ -195,14 +211,86 @@ async fn chat(
             Err(fe) => Err(failover_error(fe, skipped)),
         }
     } else {
+        // Opt-in response cache, keyed on the resolved chain + request.
+        let cache_ttl = cache_ttl(&headers);
+        let cache_key = cache_ttl.map(|_| cache_key_of(&targets, &req));
+        if let Some(key) = &cache_key {
+            if let Some(resp) = cache_get(&state, key) {
+                return Ok(completion_response(&resp, true));
+            }
+        }
+
         match chat_failover_with(targets, &req, &policy).await {
             Ok((provider, resp)) => {
                 record(&state, &app, &provider, &resp.model, resp.usage.as_ref());
-                Ok(completion_response(resp))
+                if let (Some(ttl), Some(key)) = (cache_ttl, cache_key) {
+                    cache_put(&state, key, &resp, ttl);
+                }
+                Ok(completion_response(&resp, false))
             }
             Err(fe) => Err(failover_error(fe, skipped)),
         }
     }
+}
+
+/// Parse the `X-AI-Cache` header into a TTL. Absent/`off`/`0` disables caching;
+/// `on`/`true` uses 300s; a bare integer sets the TTL in seconds.
+fn cache_ttl(headers: &HeaderMap) -> Option<Duration> {
+    let v = headers.get("x-ai-cache")?.to_str().ok()?.trim().to_string();
+    if v.eq_ignore_ascii_case("off") || v == "0" || v.is_empty() {
+        return None;
+    }
+    let secs = if v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true") {
+        300
+    } else {
+        v.parse::<u64>().ok()?
+    };
+    Some(Duration::from_secs(secs))
+}
+
+/// Cache key: the resolved target chain plus the request fields that affect the
+/// answer. Images are included verbatim (large but correct).
+fn cache_key_of(targets: &[Target], req: &UnifiedRequest) -> String {
+    let chain: Vec<String> = targets
+        .iter()
+        .map(|t| format!("{}/{}", t.provider.name(), t.model))
+        .collect();
+    format!(
+        "{}|{}|{}|{}|{:?}|{:?}",
+        chain.join(","),
+        serde_json::to_string(&req.messages).unwrap_or_default(),
+        serde_json::to_string(&req.tools).unwrap_or_default(),
+        serde_json::to_string(&req.tool_choice).unwrap_or_default(),
+        req.temperature,
+        req.max_tokens,
+    )
+}
+
+fn cache_get(state: &AppState, key: &str) -> Option<UnifiedResponse> {
+    let mut cache = state.cache.lock().unwrap();
+    let now = Instant::now();
+    let hit = match cache.entries.get(key) {
+        Some(e) if e.expires_at > now => Some(e.response.clone()),
+        _ => None,
+    };
+    if hit.is_some() {
+        cache.hits += 1;
+    } else {
+        cache.entries.remove(key);
+        cache.misses += 1;
+    }
+    hit
+}
+
+fn cache_put(state: &AppState, key: String, resp: &UnifiedResponse, ttl: Duration) {
+    let mut cache = state.cache.lock().unwrap();
+    cache.entries.insert(
+        key,
+        CacheEntry {
+            response: resp.clone(),
+            expires_at: Instant::now() + ttl,
+        },
+    );
 }
 
 /// The calling app's identity, from `X-AI-App` (defaults to "unknown").
@@ -250,7 +338,7 @@ fn retry_policy(headers: &HeaderMap) -> RetryPolicy {
     policy
 }
 
-fn completion_response(resp: UnifiedResponse) -> Response {
+fn completion_response(resp: &UnifiedResponse, cached: bool) -> Response {
     let mut message = serde_json::Map::new();
     message.insert("role".into(), json!("assistant"));
     // OpenAI sets content to null when the turn is only tool calls.
@@ -266,7 +354,7 @@ fn completion_response(resp: UnifiedResponse) -> Response {
         );
     }
 
-    Json(json!({
+    let body = json!({
         "object": "chat.completion",
         "model": resp.model,
         "choices": [{
@@ -274,13 +362,19 @@ fn completion_response(resp: UnifiedResponse) -> Response {
             "message": Value::Object(message),
             "finish_reason": resp.finish_reason,
         }],
-        "usage": resp.usage.map(|u| json!({
+        "usage": resp.usage.as_ref().map(|u| json!({
             "prompt_tokens": u.prompt_tokens,
             "completion_tokens": u.completion_tokens,
             "total_tokens": u.total_tokens,
         })),
-    }))
-    .into_response()
+    });
+
+    let mut response = Json(body).into_response();
+    response.headers_mut().insert(
+        "x-ai-cache",
+        HeaderValue::from_static(if cached { "HIT" } else { "MISS" }),
+    );
+    response
 }
 
 fn sse_response(
@@ -348,6 +442,8 @@ async fn usage(State(state): State<AppState>) -> Json<Value> {
         }));
     }
 
+    let cache = state.cache.lock().unwrap();
+
     Json(json!({
         "totals": {
             "requests": t_req,
@@ -355,6 +451,11 @@ async fn usage(State(state): State<AppState>) -> Json<Value> {
             "completion_tokens": t_compl,
             "total_tokens": t_total,
             "cost_usd": round6(t_cost),
+        },
+        "cache": {
+            "hits": cache.hits,
+            "misses": cache.misses,
+            "entries": cache.entries.len(),
         },
         "by": by,
     }))
@@ -448,4 +549,67 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 
 fn err(code: StatusCode, msg: &str) -> ApiError {
     (code, Json(json!({ "error": { "message": msg } })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aigate_core::{resolve, Content, Message, Role};
+
+    fn headers(value: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(v) = value {
+            h.insert("x-ai-cache", HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn cache_ttl_parsing() {
+        assert_eq!(cache_ttl(&headers(None)), None);
+        assert_eq!(cache_ttl(&headers(Some("off"))), None);
+        assert_eq!(cache_ttl(&headers(Some("0"))), None);
+        assert_eq!(cache_ttl(&headers(Some("on"))), Some(Duration::from_secs(300)));
+        assert_eq!(cache_ttl(&headers(Some("60"))), Some(Duration::from_secs(60)));
+    }
+
+    fn target(model: &str) -> Target {
+        Target {
+            provider: resolve("openai").unwrap(),
+            model: model.to_string(),
+            key: "k".to_string(),
+        }
+    }
+
+    fn req(text: &str, temperature: Option<f32>) -> UnifiedRequest {
+        UnifiedRequest {
+            model: "openai/gpt-4o".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: Some(Content::Text(text.into())),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            }],
+            temperature,
+            max_tokens: None,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
+    #[test]
+    fn cache_key_is_stable_and_sensitive() {
+        let t = vec![target("gpt-4o")];
+        let a = cache_key_of(&t, &req("hi", None));
+        let b = cache_key_of(&t, &req("hi", None));
+        assert_eq!(a, b, "identical requests share a key");
+
+        let c = cache_key_of(&t, &req("hi", Some(0.9)));
+        assert_ne!(a, c, "temperature changes the key");
+
+        let d = cache_key_of(&t, &req("bye", None));
+        assert_ne!(a, d, "different content changes the key");
+    }
 }

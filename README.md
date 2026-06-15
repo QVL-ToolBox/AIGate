@@ -123,6 +123,25 @@ curl http://localhost:8080/v1/chat/completions \
 OpenAI and Claude; for **Gemini** they map to `fileData` best-effort and may not
 be fetched for arbitrary web URLs — prefer base64 data URLs for Gemini.
 
+## Response cache
+
+Opt in per request with the `X-AI-Cache` header — `on` (300s TTL) or a number of
+seconds. Identical requests (same target chain, messages, tools, temperature,
+`max_tokens`) then return the stored answer without an upstream call. The
+response carries `X-AI-Cache: HIT` or `MISS`.
+
+```bash
+curl -i http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "X-AI-Cache: 600" -H "Content-Type: application/json" \
+  -d '{ "model": "openai/gpt-4o-mini",
+        "messages": [{ "role": "user", "content": "Capital of France?" }] }'
+```
+
+Cache hits add **no** tokens or cost to `/v1/usage` (no upstream call) and are
+counted separately under `cache`. Caching is in-memory (reset on restart) and
+applies to **non-streaming** requests only.
+
 ## Usage & cost tracking
 
 Every **successful** request is aggregated in memory per `(app, provider,
@@ -219,10 +238,10 @@ header.
 - [x] **Token & cost tracking** per app (`/v1/usage`, in-memory)
 - [x] **Tool calling** across all four engines (non-streaming and streaming)
 - [x] **Multimodal image inputs** (base64 + remote URLs)
-- [ ] Persist usage metrics (currently reset on restart)
+- [x] **Response cache** (opt-in, in-memory, non-streaming)
+- [ ] Persist usage metrics & cache (currently reset on restart)
 - [ ] Auto-fetch remote images to base64 for Gemini
 - [ ] Audio/document inputs
-- [ ] Response caching
 
 ## Author
 
