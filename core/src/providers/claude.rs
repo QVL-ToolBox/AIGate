@@ -130,6 +130,18 @@ const CLAUDE_MODELS: &[&str] = &[
     "claude-3-5-haiku-latest",
 ];
 
+/// Build an Anthropic image block from an image URL (base64 or remote).
+fn image_block(url: &str) -> Value {
+    if let Some((media_type, data)) = super::parse_data_url(url) {
+        json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": data },
+        })
+    } else {
+        json!({ "type": "image", "source": { "type": "url", "url": url } })
+    }
+}
+
 /// Translate an OpenAI `tool_choice` value into Anthropic's shape.
 fn map_tool_choice(choice: &Value) -> Value {
     match choice {
@@ -155,8 +167,22 @@ impl Claude {
 
         for m in &req.messages {
             match m.role {
-                Role::System => system = m.content.clone(),
-                Role::User => messages.push(json!({ "role": "user", "content": m.text() })),
+                Role::System => system = Some(m.text()),
+                Role::User => {
+                    if m.images().is_empty() {
+                        messages.push(json!({ "role": "user", "content": m.text() }));
+                    } else {
+                        let mut blocks: Vec<Value> = Vec::new();
+                        let text = m.text();
+                        if !text.is_empty() {
+                            blocks.push(json!({ "type": "text", "text": text }));
+                        }
+                        for img in m.images() {
+                            blocks.push(image_block(&img.url));
+                        }
+                        messages.push(json!({ "role": "user", "content": blocks }));
+                    }
+                }
                 Role::Assistant => {
                     let mut blocks: Vec<Value> = Vec::new();
                     if !m.text().is_empty() {
@@ -376,7 +402,7 @@ impl Provider for Claude {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{FunctionDef, Message, Tool};
+    use crate::types::{Content, FunctionDef, Message, Tool};
 
     fn req(messages: Vec<Message>, tools: Option<Vec<Tool>>) -> UnifiedRequest {
         UnifiedRequest {
@@ -410,7 +436,7 @@ mod tests {
     fn tool_result_becomes_user_block() {
         let msg = Message {
             role: Role::Tool,
-            content: Some("{\"temp\":20}".into()),
+            content: Some(Content::Text("{\"temp\":20}".into())),
             tool_calls: None,
             tool_call_id: Some("toolu_1".into()),
             name: None,
@@ -420,5 +446,17 @@ mod tests {
         assert_eq!(m["role"], "user");
         assert_eq!(m["content"][0]["type"], "tool_result");
         assert_eq!(m["content"][0]["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn image_blocks_map_base64_and_url() {
+        let data = image_block("data:image/png;base64,AAAA");
+        assert_eq!(data["source"]["type"], "base64");
+        assert_eq!(data["source"]["media_type"], "image/png");
+        assert_eq!(data["source"]["data"], "AAAA");
+
+        let remote = image_block("https://x/y.jpg");
+        assert_eq!(remote["source"]["type"], "url");
+        assert_eq!(remote["source"]["url"], "https://x/y.jpg");
     }
 }

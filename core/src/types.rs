@@ -37,6 +37,30 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
+/// An image reference, by http(s) URL or `data:` URL (base64).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// One part of a multimodal message (OpenAI content-part shape).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+/// Message content: a plain string, or an array of multimodal parts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Content {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
 /// A single chat message. `content` is optional (an assistant message that only
 /// makes tool calls has none); `tool_calls` appears on assistant turns and
 /// `tool_call_id` on `tool`-role results.
@@ -44,7 +68,7 @@ pub struct ToolCall {
 pub struct Message {
     pub role: Role,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<Content>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,9 +78,34 @@ pub struct Message {
 }
 
 impl Message {
-    /// Text content, or empty string when absent.
-    pub fn text(&self) -> &str {
-        self.content.as_deref().unwrap_or("")
+    /// Concatenated text across content parts (images ignored); empty if none.
+    pub fn text(&self) -> String {
+        match &self.content {
+            None => String::new(),
+            Some(Content::Text(s)) => s.clone(),
+            Some(Content::Parts(parts)) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageUrl { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    /// Image parts in order, if any.
+    pub fn images(&self) -> Vec<&ImageUrl> {
+        match &self.content {
+            Some(Content::Parts(parts)) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::ImageUrl { image_url } => Some(image_url),
+                    ContentPart::Text { .. } => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -151,5 +200,28 @@ pub fn split_model(model: &str) -> (Option<&str>, &str) {
     match model.split_once('/') {
         Some((provider, model)) => (Some(provider), model),
         None => (None, model),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_deserializes_string_or_parts() {
+        let s: Message = serde_json::from_str(r#"{"role":"user","content":"hi"}"#).unwrap();
+        assert_eq!(s.text(), "hi");
+        assert!(s.images().is_empty());
+
+        let m: Message = serde_json::from_str(
+            r#"{"role":"user","content":[
+                {"type":"text","text":"what is this?"},
+                {"type":"image_url","image_url":{"url":"https://x/y.png"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.text(), "what is this?");
+        assert_eq!(m.images().len(), 1);
+        assert_eq!(m.images()[0].url, "https://x/y.png");
     }
 }

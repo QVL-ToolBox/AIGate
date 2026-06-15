@@ -20,6 +20,18 @@ pub fn resolve(name: &str) -> Option<Box<dyn Provider>> {
     }
 }
 
+/// Parse a base64 `data:` URL into `(media_type, base64_data)`. Returns `None`
+/// for non-data URLs or non-base64 data URLs.
+pub(crate) fn parse_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if !meta.contains("base64") {
+        return None;
+    }
+    let media_type = meta.split(';').next().unwrap_or("application/octet-stream");
+    Some((media_type, data))
+}
+
 /// Turn a non-success HTTP response into a structured [`AiError::Upstream`].
 pub(crate) async fn ensure_ok(
     resp: reqwest::Response,

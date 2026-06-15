@@ -101,6 +101,28 @@ emitted as OpenAI-compatible `delta.tool_calls` fragments (id+name on the first
 fragment, arguments streamed as partial JSON), so a standard OpenAI streaming
 client reassembles them as usual.
 
+## Multimodal (image inputs)
+
+Send images with the OpenAI content-parts shape; AIGate translates them to each
+engine (Claude `image` blocks, Gemini `inlineData`/`fileData`). Both `data:` URLs
+(base64) and remote `https://` URLs are accepted.
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-4o-mini",
+    "messages": [{ "role": "user", "content": [
+      { "type": "text", "text": "What is in this image?" },
+      { "type": "image_url", "image_url": { "url": "data:image/png;base64,iVBORw0..." } }
+    ]}]
+  }'
+```
+
+`data:` URLs work everywhere (the portable path). Remote URLs work natively on
+OpenAI and Claude; for **Gemini** they map to `fileData` best-effort and may not
+be fetched for arbitrary web URLs — prefer base64 data URLs for Gemini.
+
 ## Usage & cost tracking
 
 Every **successful** request is aggregated in memory per `(app, provider,
@@ -196,8 +218,10 @@ header.
 - [x] **`/v1/models`** listing (live with key, built-in catalog without)
 - [x] **Token & cost tracking** per app (`/v1/usage`, in-memory)
 - [x] **Tool calling** across all four engines (non-streaming and streaming)
+- [x] **Multimodal image inputs** (base64 + remote URLs)
 - [ ] Persist usage metrics (currently reset on restart)
-- [ ] Multimodal inputs (images/audio)
+- [ ] Auto-fetch remote images to base64 for Gemini
+- [ ] Audio/document inputs
 - [ ] Response caching
 
 ## Author

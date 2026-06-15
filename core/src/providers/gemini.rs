@@ -125,6 +125,29 @@ impl ChatResp {
     }
 }
 
+/// Build a Gemini image part. Base64 data URLs become `inlineData`; remote URLs
+/// become `fileData` (best-effort — Gemini may not fetch arbitrary web URLs).
+fn image_part(url: &str) -> Value {
+    if let Some((mime, data)) = super::parse_data_url(url) {
+        json!({ "inlineData": { "mimeType": mime, "data": data } })
+    } else {
+        json!({ "fileData": { "mimeType": guess_mime(url), "fileUri": url } })
+    }
+}
+
+fn guess_mime(url: &str) -> &'static str {
+    let u = url.to_ascii_lowercase();
+    if u.ends_with(".png") {
+        "image/png"
+    } else if u.ends_with(".webp") {
+        "image/webp"
+    } else if u.ends_with(".gif") {
+        "image/gif"
+    } else {
+        "image/jpeg"
+    }
+}
+
 /// Translate an OpenAI `tool_choice` value into Gemini's `toolConfig`.
 fn map_tool_choice(choice: &Value) -> Value {
     let cfg = match choice {
@@ -164,7 +187,18 @@ impl Gemini {
                     system_instruction = Some(json!({ "parts": [{ "text": m.text() }] }))
                 }
                 Role::User => {
-                    contents.push(json!({ "role": "user", "parts": [{ "text": m.text() }] }))
+                    let mut parts: Vec<Value> = Vec::new();
+                    let text = m.text();
+                    if !text.is_empty() {
+                        parts.push(json!({ "text": text }));
+                    }
+                    for img in m.images() {
+                        parts.push(image_part(&img.url));
+                    }
+                    if parts.is_empty() {
+                        parts.push(json!({ "text": "" }));
+                    }
+                    contents.push(json!({ "role": "user", "parts": parts }));
                 }
                 Role::Assistant => {
                     let mut parts: Vec<Value> = Vec::new();
@@ -192,9 +226,10 @@ impl Gemini {
                         .and_then(|id| id_to_name.get(id).copied())
                         .unwrap_or("");
                     // functionResponse.response must be an object.
-                    let response = match m.content.as_deref().map(serde_json::from_str::<Value>) {
-                        Some(Ok(v)) if v.is_object() => v,
-                        _ => json!({ "result": m.text() }),
+                    let text = m.text();
+                    let response = match serde_json::from_str::<Value>(&text) {
+                        Ok(v) if v.is_object() => v,
+                        _ => json!({ "result": text }),
                     };
                     contents.push(json!({
                         "role": "user",
@@ -365,7 +400,7 @@ impl Provider for Gemini {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Message;
+    use crate::types::{Content, Message};
 
     #[test]
     fn tool_result_resolves_name_from_prior_call() {
@@ -385,7 +420,7 @@ mod tests {
         };
         let tool = Message {
             role: Role::Tool,
-            content: Some("{\"temp\":20}".into()),
+            content: Some(Content::Text("{\"temp\":20}".into())),
             tool_calls: None,
             tool_call_id: Some("call_0".into()),
             name: None,
@@ -407,5 +442,16 @@ mod tests {
         let fr = &contents[1]["parts"][0]["functionResponse"];
         assert_eq!(fr["name"], "get_weather");
         assert_eq!(fr["response"]["temp"], 20);
+    }
+
+    #[test]
+    fn image_parts_map_inline_and_filedata() {
+        let inline = image_part("data:image/jpeg;base64,ZZ");
+        assert_eq!(inline["inlineData"]["mimeType"], "image/jpeg");
+        assert_eq!(inline["inlineData"]["data"], "ZZ");
+
+        let remote = image_part("https://x/y.png");
+        assert_eq!(remote["fileData"]["mimeType"], "image/png");
+        assert_eq!(remote["fileData"]["fileUri"], "https://x/y.png");
     }
 }

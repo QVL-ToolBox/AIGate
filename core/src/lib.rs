@@ -20,6 +20,6 @@ pub use pricing::{estimate_cost, pricing, Pricing};
 pub use provider::{ChunkStream, Provider};
 pub use providers::{resolve, PROVIDERS};
 pub use types::{
-    split_model, Chunk, FunctionCall, FunctionDef, Message, Role, Tool, ToolCall, ToolCallChunk,
-    UnifiedRequest, UnifiedResponse, Usage,
+    split_model, Chunk, Content, ContentPart, FunctionCall, FunctionDef, ImageUrl, Message, Role,
+    Tool, ToolCall, ToolCallChunk, UnifiedRequest, UnifiedResponse, Usage,
 };
