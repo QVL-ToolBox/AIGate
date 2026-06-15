@@ -10,6 +10,6 @@ pub mod providers;
 pub mod types;
 
 pub use error::AiError;
-pub use provider::Provider;
+pub use provider::{ChunkStream, Provider};
 pub use providers::resolve;
-pub use types::{split_model, Message, Role, UnifiedRequest, UnifiedResponse, Usage};
+pub use types::{split_model, Chunk, Message, Role, UnifiedRequest, UnifiedResponse, Usage};

@@ -2,11 +2,13 @@
 //! a separate `systemInstruction`, and the API key as a query parameter.
 
 use async_trait::async_trait;
+use eventsource_stream::Eventsource;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AiError;
-use crate::provider::Provider;
-use crate::types::{Role, UnifiedRequest, UnifiedResponse, Usage};
+use crate::provider::{ChunkStream, Provider};
+use crate::types::{Chunk, Role, UnifiedRequest, UnifiedResponse, Usage};
 
 pub struct Gemini {
     client: reqwest::Client,
@@ -76,13 +78,33 @@ struct UsageMeta {
     total_token_count: u32,
 }
 
-#[async_trait]
-impl Provider for Gemini {
-    fn name(&self) -> &'static str {
-        "gemini"
+impl UsageMeta {
+    fn into_usage(self) -> Usage {
+        Usage {
+            prompt_tokens: self.prompt_token_count,
+            completion_tokens: self.candidates_token_count,
+            total_tokens: self.total_token_count,
+        }
     }
+}
 
-    async fn chat(&self, req: &UnifiedRequest, key: &str) -> Result<UnifiedResponse, AiError> {
+impl ChatResp {
+    /// Reduce one response payload (full or streamed) into a `(text, finish, usage)`.
+    fn into_parts(self) -> (String, Option<String>, Option<Usage>) {
+        let usage = self.usage_metadata.map(UsageMeta::into_usage);
+        match self.candidates.into_iter().next() {
+            Some(c) => (
+                c.content.parts.into_iter().map(|p| p.text).collect(),
+                c.finish_reason,
+                usage,
+            ),
+            None => (String::new(), None, usage),
+        }
+    }
+}
+
+impl Gemini {
+    fn build(req: &UnifiedRequest) -> ChatReq {
         let mut contents = Vec::new();
         let mut system_instruction = None;
         for m in &req.messages {
@@ -108,11 +130,21 @@ impl Provider for Gemini {
                 }),
             }
         }
-
-        let body = ChatReq {
+        ChatReq {
             contents,
             system_instruction,
-        };
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for Gemini {
+    fn name(&self) -> &'static str {
+        "gemini"
+    }
+
+    async fn chat(&self, req: &UnifiedRequest, key: &str) -> Result<UnifiedResponse, AiError> {
+        let body = Self::build(req);
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
             req.model
@@ -128,17 +160,54 @@ impl Provider for Gemini {
         let resp = super::ensure_ok(resp).await?;
         let parsed: ChatResp = resp.json().await?;
 
-        let candidate = parsed.candidates.into_iter().next().ok_or(AiError::EmptyResponse)?;
-        let content: String = candidate.content.parts.into_iter().map(|p| p.text).collect();
+        let (content, finish_reason, usage) = parsed.into_parts();
+        if content.is_empty() && finish_reason.is_none() {
+            return Err(AiError::EmptyResponse);
+        }
         Ok(UnifiedResponse {
             content,
             model: req.model.clone(),
-            finish_reason: candidate.finish_reason,
-            usage: parsed.usage_metadata.map(|u| Usage {
-                prompt_tokens: u.prompt_token_count,
-                completion_tokens: u.candidates_token_count,
-                total_tokens: u.total_token_count,
-            }),
+            finish_reason,
+            usage,
         })
+    }
+
+    async fn chat_stream(&self, req: &UnifiedRequest, key: &str) -> Result<ChunkStream, AiError> {
+        let body = Self::build(req);
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent",
+            req.model
+        );
+
+        let resp = self
+            .client
+            .post(url)
+            .query(&[("alt", "sse"), ("key", key)])
+            .json(&body)
+            .send()
+            .await?;
+        let resp = super::ensure_ok(resp).await?;
+
+        let stream = resp
+            .bytes_stream()
+            .eventsource()
+            .map(|event| -> Result<Option<Chunk>, AiError> {
+                let event = event.map_err(|e| AiError::Stream(e.to_string()))?;
+                let parsed: ChatResp =
+                    serde_json::from_str(&event.data).map_err(|e| AiError::Stream(e.to_string()))?;
+                let (delta, finish_reason, usage) = parsed.into_parts();
+                if delta.is_empty() && finish_reason.is_none() && usage.is_none() {
+                    Ok(None)
+                } else {
+                    Ok(Some(Chunk {
+                        delta,
+                        finish_reason,
+                        usage,
+                    }))
+                }
+            })
+            .filter_map(|r| async move { r.transpose() });
+
+        Ok(stream.boxed())
     }
 }

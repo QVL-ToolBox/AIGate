@@ -6,15 +6,22 @@
 //! `X-AI-Provider` header. The caller's API key (`Authorization: Bearer ...`)
 //! is forwarded per request and never stored.
 
+use std::convert::Infallible;
+
 use axum::{
     extract::Json,
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Router,
 };
+use futures::StreamExt;
 use serde_json::{json, Value};
 
-use aigate_core::{resolve, split_model, UnifiedRequest};
+use aigate_core::{resolve, split_model, Chunk, Provider, UnifiedRequest};
 
 type ApiError = (StatusCode, Json<Value>);
 
@@ -37,7 +44,7 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
-async fn chat(headers: HeaderMap, Json(mut req): Json<UnifiedRequest>) -> Result<Json<Value>, ApiError> {
+async fn chat(headers: HeaderMap, Json(mut req): Json<UnifiedRequest>) -> Result<Response, ApiError> {
     let key = bearer(&headers)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "missing 'Authorization: Bearer <key>'"))?;
 
@@ -63,10 +70,17 @@ async fn chat(headers: HeaderMap, Json(mut req): Json<UnifiedRequest>) -> Result
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, &format!("unknown provider: {provider_name}")))?;
 
     if req.stream {
-        // TODO(streaming): bridge each engine's SSE into a unified token stream.
-        return Err(err(StatusCode::NOT_IMPLEMENTED, "streaming not implemented yet"));
+        stream_chat(provider, req, key).await
+    } else {
+        complete_chat(provider, req, key).await
     }
+}
 
+async fn complete_chat(
+    provider: Box<dyn Provider>,
+    req: UnifiedRequest,
+    key: String,
+) -> Result<Response, ApiError> {
     let resp = provider
         .chat(&req, &key)
         .await
@@ -86,7 +100,54 @@ async fn chat(headers: HeaderMap, Json(mut req): Json<UnifiedRequest>) -> Result
             "completion_tokens": u.completion_tokens,
             "total_tokens": u.total_tokens,
         })),
-    })))
+    }))
+    .into_response())
+}
+
+async fn stream_chat(
+    provider: Box<dyn Provider>,
+    req: UnifiedRequest,
+    key: String,
+) -> Result<Response, ApiError> {
+    let upstream = provider
+        .chat_stream(&req, &key)
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, &e.to_string()))?;
+
+    let model = req.model.clone();
+    let events = upstream
+        .map(move |item| -> Result<Event, Infallible> {
+            match item {
+                Ok(chunk) => Ok(Event::default().data(chunk_envelope(&model, &chunk).to_string())),
+                Err(e) => Ok(Event::default()
+                    .event("error")
+                    .data(json!({ "error": { "message": e.to_string() } }).to_string())),
+            }
+        })
+        // OpenAI clients expect a terminal `data: [DONE]`.
+        .chain(futures::stream::once(async {
+            Ok(Event::default().data("[DONE]"))
+        }));
+
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()).into_response())
+}
+
+/// An OpenAI-compatible `chat.completion.chunk` envelope.
+fn chunk_envelope(model: &str, chunk: &Chunk) -> Value {
+    json!({
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": { "content": chunk.delta },
+            "finish_reason": chunk.finish_reason,
+        }],
+        "usage": chunk.usage.as_ref().map(|u| json!({
+            "prompt_tokens": u.prompt_tokens,
+            "completion_tokens": u.completion_tokens,
+            "total_tokens": u.total_tokens,
+        })),
+    })
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {

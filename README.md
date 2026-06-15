@@ -64,10 +64,24 @@ Switch engine by changing the prefix and the key:
 | Claude   | `claude/`, `anthropic/` | `x-api-key` (handled internally) |
 | Gemini   | `gemini/`, `google/`    | API key query param (handled internally) |
 
+## Streaming
+
+Set `"stream": true` to receive an OpenAI-compatible SSE stream
+(`chat.completion.chunk` events terminated by `data: [DONE]`). Each engine's
+native stream format (OpenAI/Mistral delta chunks, Anthropic named events,
+Gemini `streamGenerateContent`) is normalized behind the same surface.
+
+```bash
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "openai/gpt-4o-mini", "stream": true,
+        "messages": [{ "role": "user", "content": "Count to 5" }] }'
+```
+
 ## Roadmap
 
-- [ ] **Streaming** (SSE token-by-token) — the next milestone; the trait and
-      endpoint already reserve the seam.
+- [x] **Streaming** (SSE token-by-token) across all four engines
 - [ ] Provider failover / fallback
 - [ ] `/v1/models` listing
 - [ ] Token & cost tracking per app

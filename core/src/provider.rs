@@ -1,9 +1,13 @@
 //! The adapter contract. Adding a new engine = implementing this trait.
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 
 use crate::error::AiError;
-use crate::types::{UnifiedRequest, UnifiedResponse};
+use crate::types::{Chunk, UnifiedRequest, UnifiedResponse};
+
+/// A normalized stream of response increments.
+pub type ChunkStream = BoxStream<'static, Result<Chunk, AiError>>;
 
 #[async_trait]
 pub trait Provider: Send + Sync {
@@ -13,8 +17,9 @@ pub trait Provider: Send + Sync {
     /// Non-streaming chat completion.
     async fn chat(&self, req: &UnifiedRequest, key: &str) -> Result<UnifiedResponse, AiError>;
 
-    // TODO(streaming): add
-    //   async fn chat_stream(&self, req: &UnifiedRequest, key: &str)
-    //       -> Result<BoxStream<'static, Result<Chunk, AiError>>, AiError>;
-    // and normalize each engine's SSE format into a shared `Chunk`.
+    /// Streaming chat completion. Defaults to unsupported so a new adapter can
+    /// ship non-streaming first and add this later.
+    async fn chat_stream(&self, _req: &UnifiedRequest, _key: &str) -> Result<ChunkStream, AiError> {
+        Err(AiError::Unsupported(format!("{}: streaming", self.name())))
+    }
 }

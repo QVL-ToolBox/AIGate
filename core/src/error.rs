@@ -14,6 +14,10 @@ pub enum AiError {
     #[error("empty response from provider")]
     EmptyResponse,
 
+    /// A failure while reading or parsing a streamed (SSE) response.
+    #[error("stream error: {0}")]
+    Stream(String),
+
     /// A capability the adapter does not implement yet.
     #[error("unsupported: {0}")]
     Unsupported(String),

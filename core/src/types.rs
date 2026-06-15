@@ -50,6 +50,18 @@ pub struct UnifiedResponse {
     pub usage: Option<Usage>,
 }
 
+/// One increment of a streamed response, normalized across engines.
+///
+/// `delta` is the text fragment for this event (may be empty on events that
+/// only carry a finish reason or usage). `finish_reason` and `usage` are set
+/// on the terminal events that provide them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Chunk {
+    pub delta: String,
+    pub finish_reason: Option<String>,
+    pub usage: Option<Usage>,
+}
+
 /// Split a `provider/model` string into its parts.
 /// `"openai/gpt-4o"` -> `(Some("openai"), "gpt-4o")`;
 /// `"gpt-4o"` -> `(None, "gpt-4o")`.
