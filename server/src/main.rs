@@ -46,6 +46,8 @@ type ApiError = (StatusCode, Json<Value>);
 struct AppState {
     metrics: Arc<Mutex<Metrics>>,
     cache: Arc<Mutex<Cache>>,
+    /// Valid gateway keys -> app name. Empty disables auth.
+    keys: Arc<HashMap<String, String>>,
 }
 
 #[derive(Default)]
@@ -99,7 +101,16 @@ async fn main() {
         )
         .init();
 
-    let state = AppState::default();
+    let state = AppState {
+        keys: Arc::new(load_keys()),
+        ..Default::default()
+    };
+    if state.keys.is_empty() {
+        tracing::warn!("gateway auth DISABLED (set AIGATE_KEYS to require X-AIGate-Key)");
+    } else {
+        tracing::info!("gateway auth enabled: {} key(s)", state.keys.len());
+    }
+
     let path = state_path();
     if let Some(p) = &path {
         if let Some(snap) = load_snapshot(p) {
@@ -136,9 +147,12 @@ async fn main() {
 /// engine (bearer or `X-AI-Key-<provider>`) the live list is fetched; otherwise
 /// the built-in catalog is returned. Filter to one engine with `?provider=`.
 async fn models(
+    State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers)?;
+
     let names: Vec<&str> = match params.get("provider") {
         Some(p) => {
             let p = p.as_str();
@@ -180,6 +194,8 @@ async fn chat(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
+    let authed_app = authenticate(&state, &headers)?;
+
     let req: UnifiedRequest = serde_json::from_value(body.clone())
         .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("invalid request: {e}")))?;
 
@@ -227,7 +243,8 @@ async fn chat(
     }
 
     let policy = retry_policy(&headers);
-    let app = app_id(&headers);
+    // Trust the key-derived app when auth is on; otherwise the X-AI-App header.
+    let app = authed_app.unwrap_or_else(|| app_id(&headers));
 
     if req.stream {
         // Streaming responses are not cached.
@@ -318,6 +335,43 @@ fn cache_put(state: &AppState, key: String, resp: &UnifiedResponse, ttl: Duratio
             expires_at: now_unix() + ttl.as_secs(),
         },
     );
+}
+
+/// Parse `AIGATE_KEYS` (`key:app,key:app,...`) into a key -> app map.
+/// An entry without `:app` is labelled `default`.
+fn load_keys() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Ok(raw) = std::env::var("AIGATE_KEYS") {
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (key, app) = match entry.split_once(':') {
+                Some((k, a)) => (k.trim(), a.trim()),
+                None => (entry, "default"),
+            };
+            if !key.is_empty() {
+                map.insert(key.to_string(), app.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Authenticate the caller against the configured gateway keys.
+/// - auth disabled (no keys) -> `Ok(None)` (caller falls back to `X-AI-App`)
+/// - valid `X-AIGate-Key`     -> `Ok(Some(app))` (trusted app identity)
+/// - missing/invalid key      -> `Err(401)`
+fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    if state.keys.is_empty() {
+        return Ok(None);
+    }
+    let presented = headers.get("x-aigate-key").and_then(|v| v.to_str().ok());
+    match presented.and_then(|k| state.keys.get(k)) {
+        Some(app) => Ok(Some(app.clone())),
+        None => Err(err(StatusCode::UNAUTHORIZED, "invalid or missing X-AIGate-Key")),
+    }
 }
 
 /// The calling app's identity, from `X-AI-App` (defaults to "unknown").
@@ -442,7 +496,9 @@ fn sse_response(
 }
 
 /// `GET /v1/usage` — aggregated token and cost metrics since startup.
-async fn usage(State(state): State<AppState>) -> Json<Value> {
+async fn usage(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    authenticate(&state, &headers)?;
+
     let metrics = state.metrics.lock().unwrap();
     let mut rows: Vec<(&StatKey, &Stat)> = metrics.entries.iter().collect();
     rows.sort_by(|(a, _), (b, _)| {
@@ -471,7 +527,7 @@ async fn usage(State(state): State<AppState>) -> Json<Value> {
 
     let cache = state.cache.lock().unwrap();
 
-    Json(json!({
+    Ok(Json(json!({
         "totals": {
             "requests": t_req,
             "prompt_tokens": t_prompt,
@@ -485,7 +541,7 @@ async fn usage(State(state): State<AppState>) -> Json<Value> {
             "entries": cache.entries.len(),
         },
         "by": by,
-    }))
+    })))
 }
 
 fn round6(x: f64) -> f64 {
@@ -795,6 +851,35 @@ mod tests {
 
         let d = cache_key_of(&t, &req("bye", None));
         assert_ne!(a, d, "different content changes the key");
+    }
+
+    #[test]
+    fn auth_enforced_only_when_keys_configured() {
+        // Auth disabled: no keys -> Ok(None) regardless of header.
+        let open = AppState::default();
+        assert!(matches!(authenticate(&open, &HeaderMap::new()), Ok(None)));
+
+        // Auth enabled.
+        let mut keys = HashMap::new();
+        keys.insert("secret".to_string(), "web".to_string());
+        let secured = AppState {
+            keys: Arc::new(keys),
+            ..Default::default()
+        };
+
+        // Missing key -> 401.
+        let (code, _) = authenticate(&secured, &HeaderMap::new()).unwrap_err();
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+        // Wrong key -> 401.
+        let mut bad = HeaderMap::new();
+        bad.insert("x-aigate-key", HeaderValue::from_static("nope"));
+        assert!(authenticate(&secured, &bad).is_err());
+
+        // Valid key -> app identity from the key.
+        let mut good = HeaderMap::new();
+        good.insert("x-aigate-key", HeaderValue::from_static("secret"));
+        assert_eq!(authenticate(&secured, &good).unwrap(), Some("web".to_string()));
     }
 
     #[test]

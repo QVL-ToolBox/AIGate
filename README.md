@@ -167,6 +167,30 @@ unpriced models still count tokens with `cost_usd` unchanged. Metrics are
 **ephemeral** — they reset when the daemon restarts. For streaming, usage is
 recorded from the final chunk that carries it (Claude streaming omits it).
 
+## Gateway authentication
+
+By default AIGate is **open** (anyone who can reach it can use it). Set
+`AIGATE_KEYS` to require a gateway key on every `/v1/*` request (`/health` stays
+open). Keys are distinct from provider keys: the **gateway** key goes in
+`X-AIGate-Key`, the **provider** key stays in `Authorization: Bearer`.
+
+```bash
+# key:app pairs, comma-separated
+export AIGATE_KEYS="s3cret-web:web-app,s3cret-mob:mobile-app"
+```
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "X-AIGate-Key: s3cret-web" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "model": "openai/gpt-4o-mini", "messages": [{ "role": "user", "content": "hi" }] }'
+```
+
+When auth is on, the app identity for `/v1/usage` is taken from the **key**
+(trusted), not the self-declared `X-AI-App` header. Keys come from the
+environment and are never persisted.
+
 ## Persistence
 
 Usage metrics and the response cache are snapshotted to a JSON file so they
@@ -254,7 +278,9 @@ header.
 - [x] **Multimodal image inputs** (base64 + remote URLs)
 - [x] **Response cache** (opt-in, non-streaming)
 - [x] **Persistence** of metrics & cache (JSON snapshot, survives restart)
+- [x] **Gateway authentication** (per-app keys via `X-AIGate-Key`)
 - [ ] Cache size bound / LRU eviction
+- [ ] Per-key rate limiting
 - [ ] Auto-fetch remote images to base64 for Gemini
 - [ ] Audio/document inputs
 
