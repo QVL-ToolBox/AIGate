@@ -67,6 +67,36 @@ Returns an OpenAI-compatible `{ "object": "list", "data": [...] }` where each
 available for an engine (bearer or `X-AI-Key-<provider>`), its live catalog is
 fetched; otherwise a built-in fallback catalog is returned (no key needed).
 
+## Tool calling
+
+Declare tools in the OpenAI format; AIGate translates them to each engine's
+native shape (OpenAI/Mistral passthrough, Claude `tool_use`/`tool_result`
+blocks, Gemini `functionDeclarations`/`functionResponse`) and normalizes the
+model's tool calls back to OpenAI `tool_calls`. AIGate does **not** execute
+tools — your app runs the loop and sends results back as `tool` messages.
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-4o-mini",
+    "messages": [{ "role": "user", "content": "Weather in Paris?" }],
+    "tools": [{ "type": "function", "function": {
+      "name": "get_weather", "description": "Get weather",
+      "parameters": { "type": "object",
+        "properties": { "city": { "type": "string" } }, "required": ["city"] }
+    }}],
+    "tool_choice": "auto"
+  }'
+```
+
+The assistant turn comes back with `tool_calls` and `finish_reason:
+"tool_calls"`. Append it plus a `{"role":"tool","tool_call_id":"…","content":"…"}`
+message and call again. `tool_choice` accepts `auto` / `required` / `none` / a
+specific `{"type":"function","function":{"name":"…"}}`. Gemini doesn't return
+call ids, so AIGate synthesizes them. Tool calling over **streaming** is not yet
+supported (text deltas only).
+
 ## Usage & cost tracking
 
 Every **successful** request is aggregated in memory per `(app, provider,
@@ -161,8 +191,10 @@ header.
 - [x] **Smart retry policy** (transient retry + backoff, abort on client errors)
 - [x] **`/v1/models`** listing (live with key, built-in catalog without)
 - [x] **Token & cost tracking** per app (`/v1/usage`, in-memory)
+- [x] **Tool calling** (non-streaming) across all four engines
+- [ ] Tool calling over streaming
 - [ ] Persist usage metrics (currently reset on restart)
-- [ ] Tool calling and multimodal (lowest-common-denominator mapping)
+- [ ] Multimodal inputs (images/audio)
 - [ ] Response caching
 
 ## Author

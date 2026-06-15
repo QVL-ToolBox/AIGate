@@ -1,14 +1,16 @@
 //! Anthropic (Claude) adapter. Claude keeps the system prompt out of the
-//! message list and uses `x-api-key` + a version header.
+//! message list, uses `x-api-key` + a version header, and represents tool use
+//! as content blocks (`tool_use` from the model, `tool_result` back to it).
 
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::error::AiError;
 use crate::provider::{ChunkStream, Provider};
-use crate::types::{Chunk, Role, UnifiedRequest, UnifiedResponse, Usage};
+use crate::types::{Chunk, FunctionCall, Role, ToolCall, UnifiedRequest, UnifiedResponse, Usage};
 
 pub struct Claude {
     client: reqwest::Client,
@@ -23,19 +25,17 @@ impl Claude {
 }
 
 #[derive(Serialize)]
-struct ChatReq<'a> {
-    model: &'a str,
+struct ChatReq {
+    model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
-    messages: Vec<Msg<'a>>,
+    messages: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
     stream: bool,
-}
-
-#[derive(Serialize)]
-struct Msg<'a> {
-    role: &'a str,
-    content: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -47,29 +47,28 @@ struct ChatResp {
 }
 
 #[derive(Deserialize)]
-struct Block {
-    #[serde(default)]
-    text: String,
+#[serde(tag = "type")]
+enum Block {
+    #[serde(rename = "text")]
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        #[serde(default)]
+        input: Value,
+    },
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Deserialize)]
 struct RawUsage {
     input_tokens: u32,
     output_tokens: u32,
-}
-
-// ── Streaming wire types ────────────────────────────────────────────────
-// Anthropic emits named SSE events; we only care about text deltas and the
-// terminal stop reason.
-#[derive(Deserialize)]
-struct ContentBlockDelta {
-    delta: TextDelta,
-}
-
-#[derive(Deserialize)]
-struct TextDelta {
-    #[serde(default)]
-    text: String,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +81,17 @@ struct StopDelta {
     stop_reason: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ContentBlockDelta {
+    delta: TextDelta,
+}
+
+#[derive(Deserialize)]
+struct TextDelta {
+    #[serde(default)]
+    text: String,
+}
+
 const CLAUDE_MODELS: &[&str] = &[
     "claude-opus-4-1",
     "claude-sonnet-4-5",
@@ -89,42 +99,108 @@ const CLAUDE_MODELS: &[&str] = &[
     "claude-3-5-haiku-latest",
 ];
 
-#[derive(Deserialize)]
-struct ModelsResp {
-    data: Vec<ModelEntry>,
-}
-
-#[derive(Deserialize)]
-struct ModelEntry {
-    id: String,
+/// Translate an OpenAI `tool_choice` value into Anthropic's shape.
+fn map_tool_choice(choice: &Value) -> Value {
+    match choice {
+        Value::String(s) => match s.as_str() {
+            "required" | "any" => json!({ "type": "any" }),
+            "none" => json!({ "type": "none" }),
+            _ => json!({ "type": "auto" }),
+        },
+        Value::Object(o) => o
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .map(|name| json!({ "type": "tool", "name": name }))
+            .unwrap_or_else(|| json!({ "type": "auto" })),
+        _ => json!({ "type": "auto" }),
+    }
 }
 
 impl Claude {
-    /// Split the unified messages into Anthropic's `system` + `messages` shape.
-    fn build<'a>(req: &'a UnifiedRequest, stream: bool) -> ChatReq<'a> {
+    fn build(req: &UnifiedRequest, stream: bool) -> ChatReq {
         let mut system = None;
-        let mut messages = Vec::new();
+        let mut messages: Vec<Value> = Vec::new();
+
         for m in &req.messages {
             match m.role {
-                Role::System => system = Some(m.content.clone()),
-                Role::User => messages.push(Msg {
-                    role: "user",
-                    content: &m.content,
-                }),
-                Role::Assistant => messages.push(Msg {
-                    role: "assistant",
-                    content: &m.content,
-                }),
+                Role::System => system = m.content.clone(),
+                Role::User => messages.push(json!({ "role": "user", "content": m.text() })),
+                Role::Assistant => {
+                    let mut blocks: Vec<Value> = Vec::new();
+                    if !m.text().is_empty() {
+                        blocks.push(json!({ "type": "text", "text": m.text() }));
+                    }
+                    if let Some(calls) = &m.tool_calls {
+                        for call in calls {
+                            let input: Value =
+                                serde_json::from_str(&call.function.arguments).unwrap_or(json!({}));
+                            blocks.push(json!({
+                                "type": "tool_use",
+                                "id": call.id,
+                                "name": call.function.name,
+                                "input": input,
+                            }));
+                        }
+                    }
+                    if blocks.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": "" }));
+                    }
+                    messages.push(json!({ "role": "assistant", "content": blocks }));
+                }
+                Role::Tool => messages.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                        "content": m.text(),
+                    }],
+                })),
             }
         }
+
+        let tools = req.tools.as_ref().map(|ts| {
+            ts.iter()
+                .map(|t| {
+                    let mut tool = serde_json::Map::new();
+                    tool.insert("name".into(), json!(t.function.name));
+                    if let Some(d) = &t.function.description {
+                        tool.insert("description".into(), json!(d));
+                    }
+                    tool.insert(
+                        "input_schema".into(),
+                        t.function
+                            .parameters
+                            .clone()
+                            .unwrap_or_else(|| json!({ "type": "object" })),
+                    );
+                    Value::Object(tool)
+                })
+                .collect()
+        });
+
         ChatReq {
-            model: &req.model,
+            model: req.model.clone(),
             // Anthropic requires max_tokens; default to a sane value.
             max_tokens: req.max_tokens.unwrap_or(1024),
             system,
             messages,
+            tools,
+            tool_choice: req.tool_choice.as_ref().map(map_tool_choice),
             stream,
         }
+    }
+
+    async fn send(&self, body: &ChatReq, key: &str) -> Result<reqwest::Response, AiError> {
+        let resp = self
+            .client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+            .json(body)
+            .send()
+            .await?;
+        super::ensure_ok(resp).await
     }
 }
 
@@ -136,23 +212,37 @@ impl Provider for Claude {
 
     async fn chat(&self, req: &UnifiedRequest, key: &str) -> Result<UnifiedResponse, AiError> {
         let body = Self::build(req, false);
+        let parsed: ChatResp = self.send(&body, key).await?.json().await?;
 
-        let resp = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await?;
-        let resp = super::ensure_ok(resp).await?;
-        let parsed: ChatResp = resp.json().await?;
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        for block in parsed.content {
+            match block {
+                Block::Text { text } => content.push_str(&text),
+                Block::ToolUse { id, name, input } => tool_calls.push(ToolCall {
+                    id,
+                    kind: "function".to_string(),
+                    function: FunctionCall {
+                        name,
+                        arguments: input.to_string(),
+                    },
+                }),
+                Block::Other => {}
+            }
+        }
 
-        let content: String = parsed.content.into_iter().map(|b| b.text).collect();
+        let tool_calls = (!tool_calls.is_empty()).then_some(tool_calls);
+        let finish_reason = if tool_calls.is_some() {
+            Some("tool_calls".to_string())
+        } else {
+            parsed.stop_reason
+        };
+
         Ok(UnifiedResponse {
             content,
+            tool_calls,
             model: parsed.model,
-            finish_reason: parsed.stop_reason,
+            finish_reason,
             usage: parsed.usage.map(|u| Usage {
                 prompt_tokens: u.input_tokens,
                 completion_tokens: u.output_tokens,
@@ -163,16 +253,7 @@ impl Provider for Claude {
 
     async fn chat_stream(&self, req: &UnifiedRequest, key: &str) -> Result<ChunkStream, AiError> {
         let body = Self::build(req, true);
-
-        let resp = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await?;
-        let resp = super::ensure_ok(resp).await?;
+        let resp = self.send(&body, key).await?;
 
         let stream = resp
             .bytes_stream()
@@ -214,6 +295,15 @@ impl Provider for Claude {
     }
 
     async fn list_models(&self, key: &str) -> Result<Vec<String>, AiError> {
+        #[derive(Deserialize)]
+        struct ModelsResp {
+            data: Vec<ModelEntry>,
+        }
+        #[derive(Deserialize)]
+        struct ModelEntry {
+            id: String,
+        }
+
         let resp = self
             .client
             .get("https://api.anthropic.com/v1/models")
@@ -224,5 +314,55 @@ impl Provider for Claude {
         let resp = super::ensure_ok(resp).await?;
         let parsed: ModelsResp = resp.json().await?;
         Ok(parsed.data.into_iter().map(|m| m.id).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{FunctionDef, Message, Tool};
+
+    fn req(messages: Vec<Message>, tools: Option<Vec<Tool>>) -> UnifiedRequest {
+        UnifiedRequest {
+            model: "claude-sonnet-4-5".into(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            stream: false,
+            tools,
+            tool_choice: None,
+        }
+    }
+
+    #[test]
+    fn tools_become_input_schema() {
+        let tool = Tool {
+            kind: "function".into(),
+            function: FunctionDef {
+                name: "get_weather".into(),
+                description: Some("Weather".into()),
+                parameters: Some(json!({ "type": "object", "properties": {} })),
+            },
+        };
+        let body = Claude::build(&req(vec![], Some(vec![tool])), false);
+        let tools = body.tools.expect("tools present");
+        assert_eq!(tools[0]["name"], "get_weather");
+        assert!(tools[0].get("input_schema").is_some());
+    }
+
+    #[test]
+    fn tool_result_becomes_user_block() {
+        let msg = Message {
+            role: Role::Tool,
+            content: Some("{\"temp\":20}".into()),
+            tool_calls: None,
+            tool_call_id: Some("toolu_1".into()),
+            name: None,
+        };
+        let body = Claude::build(&req(vec![msg], None), false);
+        let m = &body.messages[0];
+        assert_eq!(m["role"], "user");
+        assert_eq!(m["content"][0]["type"], "tool_result");
+        assert_eq!(m["content"][0]["tool_use_id"], "toolu_1");
     }
 }

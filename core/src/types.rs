@@ -2,6 +2,7 @@
 //! HTTP layer can deserialize an OpenAI-compatible body straight into them.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Role of a chat message, normalized across every engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,13 +11,71 @@ pub enum Role {
     System,
     User,
     Assistant,
+    Tool,
 }
 
-/// A single chat message.
+fn default_function() -> String {
+    "function".to_string()
+}
+
+/// A function invocation requested by the model (OpenAI convention: `arguments`
+/// is a JSON-encoded string, not a parsed object).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCall {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// One tool call in an assistant message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    #[serde(default)]
+    pub id: String,
+    #[serde(rename = "type", default = "default_function")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+/// A single chat message. `content` is optional (an assistant message that only
+/// makes tool calls has none); `tool_calls` appears on assistant turns and
+/// `tool_call_id` on `tool`-role results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
-    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Message {
+    /// Text content, or empty string when absent.
+    pub fn text(&self) -> &str {
+        self.content.as_deref().unwrap_or("")
+    }
+}
+
+/// A function the model may call. `parameters` is a JSON Schema object.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
+}
+
+/// A tool declaration (only `function` tools are supported).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    #[serde(rename = "type", default = "default_function")]
+    pub kind: String,
+    pub function: FunctionDef,
 }
 
 /// A provider-agnostic chat request. `model` may carry a `provider/model`
@@ -31,6 +90,11 @@ pub struct UnifiedRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<Tool>>,
+    /// Raw OpenAI `tool_choice` value, translated per engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
 }
 
 /// Token accounting, normalized across engines.
@@ -45,6 +109,8 @@ pub struct Usage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedResponse {
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
     pub model: String,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
@@ -54,7 +120,8 @@ pub struct UnifiedResponse {
 ///
 /// `delta` is the text fragment for this event (may be empty on events that
 /// only carry a finish reason or usage). `finish_reason` and `usage` are set
-/// on the terminal events that provide them.
+/// on the terminal events that provide them. Streamed tool calls are not yet
+/// surfaced here.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Chunk {
     pub delta: String,

@@ -6,9 +6,11 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use serde_json::Value;
+
 use crate::error::AiError;
 use crate::provider::{ChunkStream, Provider};
-use crate::types::{Chunk, Message, UnifiedRequest, UnifiedResponse, Usage};
+use crate::types::{Chunk, Message, Tool, ToolCall, UnifiedRequest, UnifiedResponse, Usage};
 
 pub struct OpenAiCompatible {
     client: reqwest::Client,
@@ -63,6 +65,10 @@ struct ChatReq<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Tool]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'a Value>,
 }
 
 #[derive(Serialize)]
@@ -85,7 +91,10 @@ struct Choice {
 
 #[derive(Deserialize)]
 struct ChoiceMsg {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +158,8 @@ impl Provider for OpenAiCompatible {
             max_tokens: req.max_tokens,
             stream: false,
             stream_options: None,
+            tools: req.tools.as_deref(),
+            tool_choice: req.tool_choice.as_ref(),
         };
 
         let resp = self
@@ -163,7 +174,8 @@ impl Provider for OpenAiCompatible {
 
         let choice = parsed.choices.into_iter().next().ok_or(AiError::EmptyResponse)?;
         Ok(UnifiedResponse {
-            content: choice.message.content,
+            content: choice.message.content.unwrap_or_default(),
+            tool_calls: choice.message.tool_calls,
             model: parsed.model,
             finish_reason: choice.finish_reason,
             usage: parsed.usage.map(RawUsage::into_usage),
@@ -180,6 +192,8 @@ impl Provider for OpenAiCompatible {
             stream_options: self
                 .stream_usage
                 .then_some(StreamOptions { include_usage: true }),
+            tools: req.tools.as_deref(),
+            tool_choice: req.tool_choice.as_ref(),
         };
 
         let resp = self

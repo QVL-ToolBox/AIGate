@@ -19,4 +19,7 @@ pub use failover::{
 pub use pricing::{estimate_cost, pricing, Pricing};
 pub use provider::{ChunkStream, Provider};
 pub use providers::{resolve, PROVIDERS};
-pub use types::{split_model, Chunk, Message, Role, UnifiedRequest, UnifiedResponse, Usage};
+pub use types::{
+    split_model, Chunk, FunctionCall, FunctionDef, Message, Role, Tool, ToolCall, UnifiedRequest,
+    UnifiedResponse, Usage,
+};

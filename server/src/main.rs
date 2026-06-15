@@ -251,12 +251,27 @@ fn retry_policy(headers: &HeaderMap) -> RetryPolicy {
 }
 
 fn completion_response(resp: UnifiedResponse) -> Response {
+    let mut message = serde_json::Map::new();
+    message.insert("role".into(), json!("assistant"));
+    // OpenAI sets content to null when the turn is only tool calls.
+    if resp.content.is_empty() && resp.tool_calls.is_some() {
+        message.insert("content".into(), Value::Null);
+    } else {
+        message.insert("content".into(), json!(resp.content));
+    }
+    if let Some(calls) = &resp.tool_calls {
+        message.insert(
+            "tool_calls".into(),
+            serde_json::to_value(calls).unwrap_or(Value::Null),
+        );
+    }
+
     Json(json!({
         "object": "chat.completion",
         "model": resp.model,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": resp.content },
+            "message": Value::Object(message),
             "finish_reason": resp.finish_reason,
         }],
         "usage": resp.usage.map(|u| json!({
