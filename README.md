@@ -94,8 +94,12 @@ The assistant turn comes back with `tool_calls` and `finish_reason:
 "tool_calls"`. Append it plus a `{"role":"tool","tool_call_id":"…","content":"…"}`
 message and call again. `tool_choice` accepts `auto` / `required` / `none` / a
 specific `{"type":"function","function":{"name":"…"}}`. Gemini doesn't return
-call ids, so AIGate synthesizes them. Tool calling over **streaming** is not yet
-supported (text deltas only).
+call ids, so AIGate synthesizes them.
+
+Tool calling also works over **streaming** (`"stream": true`): tool calls are
+emitted as OpenAI-compatible `delta.tool_calls` fragments (id+name on the first
+fragment, arguments streamed as partial JSON), so a standard OpenAI streaming
+client reassembles them as usual.
 
 ## Usage & cost tracking
 
@@ -191,8 +195,7 @@ header.
 - [x] **Smart retry policy** (transient retry + backoff, abort on client errors)
 - [x] **`/v1/models`** listing (live with key, built-in catalog without)
 - [x] **Token & cost tracking** per app (`/v1/usage`, in-memory)
-- [x] **Tool calling** (non-streaming) across all four engines
-- [ ] Tool calling over streaming
+- [x] **Tool calling** across all four engines (non-streaming and streaming)
 - [ ] Persist usage metrics (currently reset on restart)
 - [ ] Multimodal inputs (images/audio)
 - [ ] Response caching

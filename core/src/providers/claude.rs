@@ -10,7 +10,9 @@ use serde_json::{json, Value};
 
 use crate::error::AiError;
 use crate::provider::{ChunkStream, Provider};
-use crate::types::{Chunk, FunctionCall, Role, ToolCall, UnifiedRequest, UnifiedResponse, Usage};
+use crate::types::{
+    Chunk, FunctionCall, Role, ToolCall, ToolCallChunk, UnifiedRequest, UnifiedResponse, Usage,
+};
 
 pub struct Claude {
     client: reqwest::Client,
@@ -81,15 +83,44 @@ struct StopDelta {
     stop_reason: Option<String>,
 }
 
+// `content_block_start` — announces a block; we care about tool_use (id+name).
 #[derive(Deserialize)]
-struct ContentBlockDelta {
-    delta: TextDelta,
+struct ContentBlockStart {
+    index: u32,
+    content_block: StartBlock,
 }
 
 #[derive(Deserialize)]
-struct TextDelta {
-    #[serde(default)]
-    text: String,
+#[serde(tag = "type")]
+enum StartBlock {
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String },
+    #[serde(other)]
+    Other,
+}
+
+// `content_block_delta` — a text fragment or a tool-argument JSON fragment.
+#[derive(Deserialize)]
+struct ContentBlockDelta {
+    index: u32,
+    delta: BlockDelta,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum BlockDelta {
+    #[serde(rename = "text_delta")]
+    Text {
+        #[serde(default)]
+        text: String,
+    },
+    #[serde(rename = "input_json_delta")]
+    InputJson {
+        #[serde(default)]
+        partial_json: String,
+    },
+    #[serde(other)]
+    Other,
 }
 
 const CLAUDE_MODELS: &[&str] = &[
@@ -261,16 +292,41 @@ impl Provider for Claude {
             .map(|event| -> Result<Option<Chunk>, AiError> {
                 let event = event.map_err(|e| AiError::Stream(e.to_string()))?;
                 match event.event.as_str() {
+                    "content_block_start" => {
+                        let parsed: ContentBlockStart = serde_json::from_str(&event.data)
+                            .map_err(|e| AiError::Stream(e.to_string()))?;
+                        match parsed.content_block {
+                            StartBlock::ToolUse { id, name } => Ok(Some(Chunk {
+                                tool_calls: Some(vec![ToolCallChunk {
+                                    index: parsed.index,
+                                    id: Some(id),
+                                    name: Some(name),
+                                    arguments: String::new(),
+                                }]),
+                                ..Default::default()
+                            })),
+                            StartBlock::Other => Ok(None),
+                        }
+                    }
                     "content_block_delta" => {
                         let parsed: ContentBlockDelta = serde_json::from_str(&event.data)
                             .map_err(|e| AiError::Stream(e.to_string()))?;
-                        if parsed.delta.text.is_empty() {
-                            Ok(None)
-                        } else {
-                            Ok(Some(Chunk {
-                                delta: parsed.delta.text,
+                        match parsed.delta {
+                            BlockDelta::Text { text } if !text.is_empty() => Ok(Some(Chunk {
+                                delta: text,
                                 ..Default::default()
-                            }))
+                            })),
+                            BlockDelta::InputJson { partial_json } if !partial_json.is_empty() => {
+                                Ok(Some(Chunk {
+                                    tool_calls: Some(vec![ToolCallChunk {
+                                        index: parsed.index,
+                                        arguments: partial_json,
+                                        ..Default::default()
+                                    }]),
+                                    ..Default::default()
+                                }))
+                            }
+                            _ => Ok(None),
                         }
                     }
                     "message_delta" => {
@@ -281,7 +337,7 @@ impl Provider for Claude {
                             ..Default::default()
                         }))
                     }
-                    // message_start, content_block_start/stop, ping, message_stop
+                    // message_start, content_block_stop, ping, message_stop
                     _ => Ok(None),
                 }
             })

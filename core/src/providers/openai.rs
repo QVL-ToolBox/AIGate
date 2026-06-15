@@ -10,7 +10,9 @@ use serde_json::Value;
 
 use crate::error::AiError;
 use crate::provider::{ChunkStream, Provider};
-use crate::types::{Chunk, Message, Tool, ToolCall, UnifiedRequest, UnifiedResponse, Usage};
+use crate::types::{
+    Chunk, Message, Tool, ToolCall, ToolCallChunk, UnifiedRequest, UnifiedResponse, Usage,
+};
 
 pub struct OpenAiCompatible {
     client: reqwest::Client,
@@ -122,6 +124,26 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolDelta>>,
+}
+
+#[derive(Deserialize)]
+struct ToolDelta {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<FnDelta>,
+}
+
+#[derive(Deserialize)]
+struct FnDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -141,6 +163,42 @@ impl RawUsage {
             completion_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
         }
+    }
+}
+
+/// Convert one streamed payload into a unified [`Chunk`], or `None` if it
+/// carries nothing useful.
+fn chunk_from(parsed: StreamResp) -> Option<Chunk> {
+    let (delta, finish_reason, tool_calls) = match parsed.choices.into_iter().next() {
+        Some(c) => {
+            let delta = c.delta.content.unwrap_or_default();
+            let tool_calls = c.delta.tool_calls.map(|deltas| {
+                deltas
+                    .into_iter()
+                    .map(|t| ToolCallChunk {
+                        index: t.index,
+                        id: t.id,
+                        name: t.function.as_ref().and_then(|f| f.name.clone()),
+                        arguments: t.function.and_then(|f| f.arguments).unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            (delta, c.finish_reason, tool_calls)
+        }
+        None => (String::new(), None, None),
+    };
+    let usage = parsed.usage.map(RawUsage::into_usage);
+    let tool_calls = tool_calls.filter(|v| !v.is_empty());
+
+    if delta.is_empty() && tool_calls.is_none() && finish_reason.is_none() && usage.is_none() {
+        None
+    } else {
+        Some(Chunk {
+            delta,
+            tool_calls,
+            finish_reason,
+            usage,
+        })
     }
 }
 
@@ -215,20 +273,7 @@ impl Provider for OpenAiCompatible {
                 }
                 let parsed: StreamResp =
                     serde_json::from_str(&event.data).map_err(|e| AiError::Stream(e.to_string()))?;
-                let (delta, finish_reason) = match parsed.choices.into_iter().next() {
-                    Some(c) => (c.delta.content.unwrap_or_default(), c.finish_reason),
-                    None => (String::new(), None),
-                };
-                let usage = parsed.usage.map(RawUsage::into_usage);
-                if delta.is_empty() && finish_reason.is_none() && usage.is_none() {
-                    Ok(None)
-                } else {
-                    Ok(Some(Chunk {
-                        delta,
-                        finish_reason,
-                        usage,
-                    }))
-                }
+                Ok(chunk_from(parsed))
             })
             .filter_map(|r| async move { r.transpose() });
 
@@ -249,5 +294,43 @@ impl Provider for OpenAiCompatible {
         let resp = super::ensure_ok(resp).await?;
         let parsed: ModelsResp = resp.json().await?;
         Ok(parsed.data.into_iter().map(|m| m.id).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_tool_call_delta_maps() {
+        let data = r#"{"choices":[{"delta":{"tool_calls":[
+            {"index":0,"id":"call_1","type":"function","function":{"name":"f","arguments":"{\"a\":"}}
+        ]}}]}"#;
+        let parsed: StreamResp = serde_json::from_str(data).unwrap();
+        let chunk = chunk_from(parsed).expect("a chunk");
+        let tc = &chunk.tool_calls.expect("tool calls")[0];
+        assert_eq!(tc.index, 0);
+        assert_eq!(tc.id.as_deref(), Some("call_1"));
+        assert_eq!(tc.name.as_deref(), Some("f"));
+        assert_eq!(tc.arguments, "{\"a\":");
+    }
+
+    #[test]
+    fn stream_arguments_fragment_has_no_id_or_name() {
+        let data = r#"{"choices":[{"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"1}"}}
+        ]}}]}"#;
+        let parsed: StreamResp = serde_json::from_str(data).unwrap();
+        let tc = chunk_from(parsed).unwrap().tool_calls.unwrap().remove(0);
+        assert_eq!(tc.index, 0);
+        assert!(tc.id.is_none());
+        assert!(tc.name.is_none());
+        assert_eq!(tc.arguments, "1}");
+    }
+
+    #[test]
+    fn empty_keepalive_chunk_is_dropped() {
+        let parsed: StreamResp = serde_json::from_str(r#"{"choices":[]}"#).unwrap();
+        assert!(chunk_from(parsed).is_none());
     }
 }

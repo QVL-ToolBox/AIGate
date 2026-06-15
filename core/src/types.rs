@@ -116,15 +116,30 @@ pub struct UnifiedResponse {
     pub usage: Option<Usage>,
 }
 
+/// A streamed tool-call fragment, mirroring OpenAI's `delta.tool_calls` shape.
+/// `id`/`name` arrive on the first fragment for a given `index`; `arguments`
+/// streams as concatenated partial JSON across fragments.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolCallChunk {
+    pub index: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: String,
+}
+
 /// One increment of a streamed response, normalized across engines.
 ///
 /// `delta` is the text fragment for this event (may be empty on events that
-/// only carry a finish reason or usage). `finish_reason` and `usage` are set
-/// on the terminal events that provide them. Streamed tool calls are not yet
-/// surfaced here.
+/// only carry tool calls, a finish reason, or usage). `tool_calls` carries
+/// streamed function-call fragments; `finish_reason` and `usage` are set on the
+/// terminal events that provide them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Chunk {
     pub delta: String,
+    pub tool_calls: Option<Vec<ToolCallChunk>>,
     pub finish_reason: Option<String>,
     pub usage: Option<Usage>,
 }

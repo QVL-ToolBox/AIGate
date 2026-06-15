@@ -366,12 +366,39 @@ fn round6(x: f64) -> f64 {
 
 /// An OpenAI-compatible `chat.completion.chunk` envelope.
 fn chunk_envelope(model: &str, chunk: &Chunk) -> Value {
+    let mut delta = serde_json::Map::new();
+    if !chunk.delta.is_empty() {
+        delta.insert("content".into(), json!(chunk.delta));
+    }
+    if let Some(calls) = &chunk.tool_calls {
+        let arr: Vec<Value> = calls
+            .iter()
+            .map(|tc| {
+                let mut function = serde_json::Map::new();
+                if let Some(name) = &tc.name {
+                    function.insert("name".into(), json!(name));
+                }
+                function.insert("arguments".into(), json!(tc.arguments));
+
+                let mut call = serde_json::Map::new();
+                call.insert("index".into(), json!(tc.index));
+                if let Some(id) = &tc.id {
+                    call.insert("id".into(), json!(id));
+                    call.insert("type".into(), json!("function"));
+                }
+                call.insert("function".into(), Value::Object(function));
+                Value::Object(call)
+            })
+            .collect();
+        delta.insert("tool_calls".into(), json!(arr));
+    }
+
     json!({
         "object": "chat.completion.chunk",
         "model": model,
         "choices": [{
             "index": 0,
-            "delta": { "content": chunk.delta },
+            "delta": Value::Object(delta),
             "finish_reason": chunk.finish_reason,
         }],
         "usage": chunk.usage.as_ref().map(|u| json!({

@@ -13,7 +13,9 @@ use serde_json::{json, Value};
 
 use crate::error::AiError;
 use crate::provider::{ChunkStream, Provider};
-use crate::types::{Chunk, FunctionCall, Role, ToolCall, UnifiedRequest, UnifiedResponse, Usage};
+use crate::types::{
+    Chunk, FunctionCall, Role, ToolCall, ToolCallChunk, UnifiedRequest, UnifiedResponse, Usage,
+};
 
 pub struct Gemini {
     client: reqwest::Client,
@@ -295,13 +297,30 @@ impl Provider for Gemini {
                 let event = event.map_err(|e| AiError::Stream(e.to_string()))?;
                 let parsed: ChatResp =
                     serde_json::from_str(&event.data).map_err(|e| AiError::Stream(e.to_string()))?;
-                // Streamed tool calls are not surfaced as chunks yet.
-                let (delta, _tool_calls, finish_reason, usage) = parsed.into_parts();
-                if delta.is_empty() && finish_reason.is_none() && usage.is_none() {
+                let (delta, tool_calls_full, finish_reason, usage) = parsed.into_parts();
+                // Gemini sends each functionCall whole, so emit it as one fragment.
+                let tool_calls = tool_calls_full.map(|calls| {
+                    calls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, c)| ToolCallChunk {
+                            index: i as u32,
+                            id: Some(c.id),
+                            name: Some(c.function.name),
+                            arguments: c.function.arguments,
+                        })
+                        .collect::<Vec<_>>()
+                });
+                if delta.is_empty()
+                    && tool_calls.is_none()
+                    && finish_reason.is_none()
+                    && usage.is_none()
+                {
                     Ok(None)
                 } else {
                     Ok(Some(Chunk {
                         delta,
+                        tool_calls,
                         finish_reason,
                         usage,
                     }))
