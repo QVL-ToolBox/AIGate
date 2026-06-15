@@ -20,6 +20,19 @@ pub fn resolve(name: &str) -> Option<Box<dyn Provider>> {
     }
 }
 
+/// A process-wide reqwest client. `Client` is internally reference-counted, so
+/// cloning it shares one connection pool across every request and provider.
+pub(crate) fn shared_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
+}
+
+/// Parse model-emitted tool-call arguments (a JSON string) into a value,
+/// falling back to an empty object when absent or malformed.
+pub(crate) fn parse_tool_args(arguments: &str) -> serde_json::Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
+}
+
 /// Parse a base64 `data:` URL into `(media_type, base64_data)`. Returns `None`
 /// for non-data URLs or non-base64 data URLs.
 pub(crate) fn parse_data_url(url: &str) -> Option<(&str, &str)> {

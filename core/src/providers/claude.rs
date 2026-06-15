@@ -21,7 +21,7 @@ pub struct Claude {
 impl Claude {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::shared_client(),
         }
     }
 }
@@ -190,8 +190,7 @@ impl Claude {
                     }
                     if let Some(calls) = &m.tool_calls {
                         for call in calls {
-                            let input: Value =
-                                serde_json::from_str(&call.function.arguments).unwrap_or(json!({}));
+                            let input = super::parse_tool_args(&call.function.arguments);
                             blocks.push(json!({
                                 "type": "tool_use",
                                 "id": call.id,
@@ -359,7 +358,12 @@ impl Provider for Claude {
                         let parsed: MessageDelta = serde_json::from_str(&event.data)
                             .map_err(|e| AiError::Stream(e.to_string()))?;
                         Ok(parsed.delta.stop_reason.map(|r| Chunk {
-                            finish_reason: Some(r),
+                            // Normalize to OpenAI's "tool_calls" like the non-stream path.
+                            finish_reason: Some(if r == "tool_use" {
+                                "tool_calls".to_string()
+                            } else {
+                                r
+                            }),
                             ..Default::default()
                         }))
                     }

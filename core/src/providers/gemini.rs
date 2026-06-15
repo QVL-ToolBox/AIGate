@@ -24,7 +24,7 @@ pub struct Gemini {
 impl Gemini {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::shared_client(),
         }
     }
 }
@@ -207,8 +207,7 @@ impl Gemini {
                     }
                     if let Some(calls) = &m.tool_calls {
                         for call in calls {
-                            let args: Value =
-                                serde_json::from_str(&call.function.arguments).unwrap_or(json!({}));
+                            let args = super::parse_tool_args(&call.function.arguments);
                             parts.push(json!({
                                 "functionCall": { "name": call.function.name, "args": args }
                             }));
@@ -325,26 +324,47 @@ impl Provider for Gemini {
             .await?;
         let resp = super::ensure_ok(resp).await?;
 
+        // Stream-stable state: a running tool-call index (Gemini may split
+        // parallel calls across chunks, each re-starting at 0) and whether any
+        // tool call was seen (to normalize the final finish_reason).
+        let mut next_index = 0u32;
+        let mut saw_tool_call = false;
         let stream = resp
             .bytes_stream()
             .eventsource()
-            .map(|event| -> Result<Option<Chunk>, AiError> {
+            .map(move |event| -> Result<Option<Chunk>, AiError> {
                 let event = event.map_err(|e| AiError::Stream(e.to_string()))?;
                 let parsed: ChatResp =
                     serde_json::from_str(&event.data).map_err(|e| AiError::Stream(e.to_string()))?;
                 let (delta, tool_calls_full, finish_reason, usage) = parsed.into_parts();
-                // Gemini sends each functionCall whole, so emit it as one fragment.
+                // Gemini sends each functionCall whole; emit with a stream-unique
+                // index/id so calls split across chunks don't collide.
                 let tool_calls = tool_calls_full.map(|calls| {
                     calls
                         .into_iter()
-                        .enumerate()
-                        .map(|(i, c)| ToolCallChunk {
-                            index: i as u32,
-                            id: Some(c.id),
-                            name: Some(c.function.name),
-                            arguments: c.function.arguments,
+                        .map(|c| {
+                            let index = next_index;
+                            next_index += 1;
+                            ToolCallChunk {
+                                index,
+                                id: Some(format!("call_{index}")),
+                                name: Some(c.function.name),
+                                arguments: c.function.arguments,
+                            }
                         })
                         .collect::<Vec<_>>()
+                });
+                if tool_calls.is_some() {
+                    saw_tool_call = true;
+                }
+                // Match the non-stream path: report "tool_calls" once any tool
+                // call has appeared (Gemini otherwise reports "STOP").
+                let finish_reason = finish_reason.map(|r| {
+                    if saw_tool_call {
+                        "tool_calls".to_string()
+                    } else {
+                        r
+                    }
                 });
                 if delta.is_empty()
                     && tool_calls.is_none()

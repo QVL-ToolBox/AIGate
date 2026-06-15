@@ -18,14 +18,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
-    extract::{Json, Query, State},
+    extract::{Json, Query, Request, State},
     http::{header::AUTHORIZATION, HeaderMap, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -161,11 +162,16 @@ async fn main() {
         spawn_flusher(state.clone(), p.clone());
     }
 
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
+    // All /v1/* routes go through the auth + rate-limit guard.
+    let protected = Router::new()
         .route("/v1/models", get(models))
         .route("/v1/usage", get(usage))
         .route("/v1/chat/completions", post(chat))
+        .route_layer(middleware::from_fn_with_state(state.clone(), guard));
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .merge(protected)
         .with_state(state.clone());
 
     let addr = "0.0.0.0:8080";
@@ -188,13 +194,9 @@ async fn main() {
 /// engine (bearer or `X-AI-Key-<provider>`) the live list is fetched; otherwise
 /// the built-in catalog is returned. Filter to one engine with `?provider=`.
 async fn models(
-    State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
-    let id = authenticate(&state, &headers)?.unwrap_or_else(|| app_id(&headers));
-    check_rate(&state, &id)?;
-
     let names: Vec<&str> = match params.get("provider") {
         Some(p) => {
             let p = p.as_str();
@@ -233,14 +235,10 @@ async fn models(
 
 async fn chat(
     State(state): State<AppState>,
+    Extension(Identity(app)): Extension<Identity>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ApiError> {
-    let authed_app = authenticate(&state, &headers)?;
-    // Trust the key-derived app when auth is on; otherwise the X-AI-App header.
-    let app = authed_app.unwrap_or_else(|| app_id(&headers));
-    check_rate(&state, &app)?;
-
     let req: UnifiedRequest = serde_json::from_value(body.clone())
         .map_err(|e| err(StatusCode::BAD_REQUEST, &format!("invalid request: {e}")))?;
 
@@ -335,14 +333,17 @@ fn cache_ttl(headers: &HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(secs))
 }
 
-/// Cache key: the resolved target chain plus the request fields that affect the
-/// answer. Images are included verbatim (large but correct).
+/// Cache key: a hash of the resolved target chain plus the request fields that
+/// affect the answer. Hashing keeps stored keys compact even when messages
+/// carry large base64 images.
 fn cache_key_of(targets: &[Target], req: &UnifiedRequest) -> String {
+    use std::hash::{Hash, Hasher};
+
     let chain: Vec<String> = targets
         .iter()
         .map(|t| format!("{}/{}", t.provider.name(), t.model))
         .collect();
-    format!(
+    let canonical = format!(
         "{}|{}|{}|{}|{:?}|{:?}",
         chain.join(","),
         serde_json::to_string(&req.messages).unwrap_or_default(),
@@ -350,7 +351,10 @@ fn cache_key_of(targets: &[Target], req: &UnifiedRequest) -> String {
         serde_json::to_string(&req.tool_choice).unwrap_or_default(),
         req.temperature,
         req.max_tokens,
-    )
+    );
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn cache_get(state: &AppState, key: &str) -> Option<UnifiedResponse> {
@@ -396,18 +400,19 @@ fn enforce_capacity(cache: &mut Cache) {
     }
     let now = now_unix();
     cache.entries.retain(|_, e| e.expires_at > now);
-    while cache.entries.len() > cache.capacity {
-        let lru = cache
-            .entries
-            .iter()
-            .min_by_key(|(_, e)| e.last_used)
-            .map(|(k, _)| k.clone());
-        match lru {
-            Some(k) => {
-                cache.entries.remove(&k);
-            }
-            None => break,
-        }
+    if cache.entries.len() <= cache.capacity {
+        return;
+    }
+    // Evict the oldest entries in one pass instead of a min-scan per eviction.
+    let excess = cache.entries.len() - cache.capacity;
+    let mut by_age: Vec<(u64, String)> = cache
+        .entries
+        .iter()
+        .map(|(k, e)| (e.last_used, k.clone()))
+        .collect();
+    by_age.sort_unstable_by_key(|(used, _)| *used);
+    for (_, key) in by_age.into_iter().take(excess) {
+        cache.entries.remove(&key);
     }
 }
 
@@ -431,6 +436,23 @@ fn load_keys() -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// The resolved caller identity, injected by the guard middleware.
+#[derive(Clone)]
+struct Identity(String);
+
+/// Middleware for every `/v1/*` route: authenticate, rate-limit, and attach the
+/// resolved identity so handlers can't forget either check.
+async fn guard(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let app = authenticate(&state, req.headers())?.unwrap_or_else(|| app_id(req.headers()));
+    check_rate(&state, &app)?;
+    req.extensions_mut().insert(Identity(app));
+    Ok(next.run(req).await)
 }
 
 /// Authenticate the caller against the configured gateway keys.
@@ -573,6 +595,23 @@ fn completion_response(resp: &UnifiedResponse, cached: bool) -> Response {
     response
 }
 
+/// Records the last-seen streamed usage when dropped — i.e. when the stream
+/// ends *or* the client disconnects early — so usage isn't lost on cancel.
+struct UsageRecorder {
+    state: AppState,
+    app: String,
+    provider: String,
+    model: String,
+    usage: Arc<Mutex<Option<Usage>>>,
+}
+
+impl Drop for UsageRecorder {
+    fn drop(&mut self) {
+        let usage = self.usage.lock().unwrap().take();
+        record(&self.state, &self.app, &self.provider, &self.model, usage.as_ref());
+    }
+}
+
 fn sse_response(
     state: AppState,
     app: String,
@@ -580,30 +619,33 @@ fn sse_response(
     model: String,
     upstream: ChunkStream,
 ) -> Response {
-    // Capture the usage carried by a late chunk so we can record it when the
-    // stream completes.
-    let captured: Arc<Mutex<Option<Usage>>> = Arc::new(Mutex::new(None));
-    let cap = captured.clone();
-    let chunk_model = model.clone();
+    let usage = Arc::new(Mutex::new(None));
+    let recorder = UsageRecorder {
+        state,
+        app,
+        provider,
+        model,
+        usage: usage.clone(),
+    };
 
     let events = upstream
         .map(move |item| -> Result<Event, Infallible> {
+            // Held for the stream's lifetime; its Drop records usage even if the
+            // client disconnects before [DONE].
+            let recorder = &recorder;
             match item {
                 Ok(chunk) => {
                     if let Some(u) = &chunk.usage {
-                        *cap.lock().unwrap() = Some(u.clone());
+                        *usage.lock().unwrap() = Some(u.clone());
                     }
-                    Ok(Event::default().data(chunk_envelope(&chunk_model, &chunk).to_string()))
+                    Ok(Event::default().data(chunk_envelope(&recorder.model, &chunk).to_string()))
                 }
                 Err(e) => Ok(Event::default()
                     .event("error")
                     .data(json!({ "error": { "message": e.to_string() } }).to_string())),
             }
         })
-        // Runs after all chunks are consumed: record usage, then emit [DONE].
-        .chain(futures::stream::once(async move {
-            let usage = captured.lock().unwrap().clone();
-            record(&state, &app, &provider, &model, usage.as_ref());
+        .chain(futures::stream::once(async {
             Ok(Event::default().data("[DONE]"))
         }));
 
@@ -611,10 +653,7 @@ fn sse_response(
 }
 
 /// `GET /v1/usage` — aggregated token and cost metrics since startup.
-async fn usage(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
-    let id = authenticate(&state, &headers)?.unwrap_or_else(|| app_id(&headers));
-    check_rate(&state, &id)?;
-
+async fn usage(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let metrics = state.metrics.lock().unwrap();
     let mut rows: Vec<(&StatKey, &Stat)> = metrics.entries.iter().collect();
     rows.sort_by(|(a, _), (b, _)| {
@@ -886,10 +925,16 @@ fn load_snapshot(path: &Path) -> Option<Snapshot> {
     serde_json::from_slice(&data).ok()
 }
 
-/// Write atomically: serialize to a temp file, then rename over the target.
+/// Write atomically: serialize to a unique temp file, then rename over the
+/// target. The per-write temp name avoids two concurrent writers (periodic
+/// flusher + shutdown) clobbering the same temp file.
 fn write_snapshot(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let json = serde_json::to_vec_pretty(snap)?;
-    let tmp = path.with_extension("tmp");
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{seq}"));
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, path)
 }

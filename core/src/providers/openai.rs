@@ -33,7 +33,7 @@ const MISTRAL_MODELS: &[&str] = &[
 
 pub fn openai() -> OpenAiCompatible {
     OpenAiCompatible {
-        client: reqwest::Client::new(),
+        client: super::shared_client(),
         base: "https://api.openai.com/v1".to_string(),
         name: "openai",
         stream_usage: true,
@@ -43,7 +43,7 @@ pub fn openai() -> OpenAiCompatible {
 
 pub fn mistral() -> OpenAiCompatible {
     OpenAiCompatible {
-        client: reqwest::Client::new(),
+        client: super::shared_client(),
         base: "https://api.mistral.ai/v1".to_string(),
         name: "mistral",
         stream_usage: false,
