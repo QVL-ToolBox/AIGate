@@ -31,6 +31,7 @@ use axum::{
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tower_http::cors::CorsLayer;
 
 use aigate_core::{
     chat_failover_with, estimate_cost, resolve, split_model, stream_failover_with, Chunk,
@@ -172,6 +173,9 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .merge(protected)
+        // Permissive CORS so a browser test client can call the gateway.
+        // Tighten the allowed origins for production.
+        .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
     let addr = "0.0.0.0:8080";
