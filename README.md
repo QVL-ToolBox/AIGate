@@ -167,6 +167,20 @@ unpriced models still count tokens with `cost_usd` unchanged. Metrics are
 **ephemeral** — they reset when the daemon restarts. For streaming, usage is
 recorded from the final chunk that carries it (Claude streaming omits it).
 
+## Persistence
+
+Usage metrics and the response cache are snapshotted to a JSON file so they
+survive restarts. State is flushed periodically and on graceful shutdown
+(Ctrl+C), and loaded on startup (expired cache entries are dropped).
+
+| Env var             | Default              | Meaning                                  |
+|---------------------|----------------------|------------------------------------------|
+| `AIGATE_STATE_FILE` | `aigate-state.json`  | State file path; `off`/`none` disables it |
+| `AIGATE_FLUSH_SECS` | `15`                 | Background flush interval (seconds)       |
+
+Writes are atomic (temp file + rename). Persistence is best-effort: a hard kill
+may lose up to one flush interval.
+
 ## Supported engines
 
 | Provider | Prefix              | Auth                         |
@@ -238,8 +252,9 @@ header.
 - [x] **Token & cost tracking** per app (`/v1/usage`, in-memory)
 - [x] **Tool calling** across all four engines (non-streaming and streaming)
 - [x] **Multimodal image inputs** (base64 + remote URLs)
-- [x] **Response cache** (opt-in, in-memory, non-streaming)
-- [ ] Persist usage metrics & cache (currently reset on restart)
+- [x] **Response cache** (opt-in, non-streaming)
+- [x] **Persistence** of metrics & cache (JSON snapshot, survives restart)
+- [ ] Cache size bound / LRU eviction
 - [ ] Auto-fetch remote images to base64 for Gemini
 - [ ] Audio/document inputs
 

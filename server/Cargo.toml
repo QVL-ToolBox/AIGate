@@ -11,6 +11,7 @@ aigate-core = { path = "../core" }
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 futures = "0.3"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

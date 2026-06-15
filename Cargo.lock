@@ -32,6 +32,7 @@ dependencies = [
  "aigate-core",
  "axum",
  "futures",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

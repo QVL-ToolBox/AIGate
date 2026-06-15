@@ -13,8 +13,9 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::{Json, Query, State},
@@ -27,6 +28,7 @@ use axum::{
     Router,
 };
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use aigate_core::{
@@ -61,7 +63,15 @@ struct Cache {
 
 struct CacheEntry {
     response: UnifiedResponse,
-    expires_at: Instant,
+    /// Unix epoch seconds at which this entry expires (portable across restarts).
+    expires_at: u64,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Hash, Eq, PartialEq, Clone)]
@@ -90,17 +100,34 @@ async fn main() {
         .init();
 
     let state = AppState::default();
+    let path = state_path();
+    if let Some(p) = &path {
+        if let Some(snap) = load_snapshot(p) {
+            apply_snapshot(&state, snap);
+            tracing::info!("restored state from {}", p.display());
+        }
+        spawn_flusher(state.clone(), p.clone());
+    }
+
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/models", get(models))
         .route("/v1/usage", get(usage))
         .route("/v1/chat/completions", post(chat))
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = "0.0.0.0:8080";
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
     tracing::info!("AIGate listening on http://{addr}");
-    axum::serve(listener, app).await.expect("serve");
+
+    let serve = axum::serve(listener, app);
+    match path {
+        Some(p) => serve
+            .with_graceful_shutdown(shutdown_signal(state, p))
+            .await
+            .expect("serve"),
+        None => serve.await.expect("serve"),
+    }
 }
 
 /// `GET /v1/models` — OpenAI-compatible model listing aggregated across
@@ -268,7 +295,7 @@ fn cache_key_of(targets: &[Target], req: &UnifiedRequest) -> String {
 
 fn cache_get(state: &AppState, key: &str) -> Option<UnifiedResponse> {
     let mut cache = state.cache.lock().unwrap();
-    let now = Instant::now();
+    let now = now_unix();
     let hit = match cache.entries.get(key) {
         Some(e) if e.expires_at > now => Some(e.response.clone()),
         _ => None,
@@ -288,7 +315,7 @@ fn cache_put(state: &AppState, key: String, resp: &UnifiedResponse, ttl: Duratio
         key,
         CacheEntry {
             response: resp.clone(),
-            expires_at: Instant::now() + ttl,
+            expires_at: now_unix() + ttl.as_secs(),
         },
     );
 }
@@ -551,6 +578,163 @@ fn err(code: StatusCode, msg: &str) -> ApiError {
     (code, Json(json!({ "error": { "message": msg } })))
 }
 
+// ── Persistence (JSON snapshot of metrics + cache) ───────────────────────
+
+#[derive(Serialize, Deserialize, Default)]
+struct Snapshot {
+    #[serde(default)]
+    metrics: Vec<MetricRow>,
+    #[serde(default)]
+    cache_hits: u64,
+    #[serde(default)]
+    cache_misses: u64,
+    #[serde(default)]
+    cache: Vec<CacheRow>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MetricRow {
+    app: String,
+    provider: String,
+    model: String,
+    requests: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    cost_usd: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CacheRow {
+    key: String,
+    expires_at: u64,
+    response: UnifiedResponse,
+}
+
+/// Where to persist state. `AIGATE_STATE_FILE` overrides the default; set it to
+/// `off`/`none`/empty to disable persistence.
+fn state_path() -> Option<PathBuf> {
+    match std::env::var("AIGATE_STATE_FILE") {
+        Ok(v) if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") => {
+            None
+        }
+        Ok(v) => Some(v.into()),
+        Err(_) => Some("aigate-state.json".into()),
+    }
+}
+
+fn take_snapshot(state: &AppState) -> Snapshot {
+    let metrics = state.metrics.lock().unwrap();
+    let cache = state.cache.lock().unwrap();
+    Snapshot {
+        metrics: metrics
+            .entries
+            .iter()
+            .map(|(k, s)| MetricRow {
+                app: k.app.clone(),
+                provider: k.provider.clone(),
+                model: k.model.clone(),
+                requests: s.requests,
+                prompt_tokens: s.prompt_tokens,
+                completion_tokens: s.completion_tokens,
+                total_tokens: s.total_tokens,
+                cost_usd: s.cost_usd,
+            })
+            .collect(),
+        cache_hits: cache.hits,
+        cache_misses: cache.misses,
+        cache: cache
+            .entries
+            .iter()
+            .map(|(key, e)| CacheRow {
+                key: key.clone(),
+                expires_at: e.expires_at,
+                response: e.response.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn apply_snapshot(state: &AppState, snap: Snapshot) {
+    let now = now_unix();
+    {
+        let mut metrics = state.metrics.lock().unwrap();
+        for r in snap.metrics {
+            metrics.entries.insert(
+                StatKey {
+                    app: r.app,
+                    provider: r.provider,
+                    model: r.model,
+                },
+                Stat {
+                    requests: r.requests,
+                    prompt_tokens: r.prompt_tokens,
+                    completion_tokens: r.completion_tokens,
+                    total_tokens: r.total_tokens,
+                    cost_usd: r.cost_usd,
+                },
+            );
+        }
+    }
+    {
+        let mut cache = state.cache.lock().unwrap();
+        cache.hits = snap.cache_hits;
+        cache.misses = snap.cache_misses;
+        for r in snap.cache {
+            // Drop entries that already expired while we were down.
+            if r.expires_at > now {
+                cache.entries.insert(
+                    r.key,
+                    CacheEntry {
+                        response: r.response,
+                        expires_at: r.expires_at,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn load_snapshot(path: &Path) -> Option<Snapshot> {
+    let data = std::fs::read(path).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// Write atomically: serialize to a temp file, then rename over the target.
+fn write_snapshot(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(snap)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Periodically flush state to disk in the background.
+fn spawn_flusher(state: AppState, path: PathBuf) {
+    let secs = std::env::var("AIGATE_FLUSH_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(15)
+        .max(1);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(secs));
+        loop {
+            interval.tick().await;
+            if let Err(e) = write_snapshot(&path, &take_snapshot(&state)) {
+                tracing::warn!("state flush failed: {e}");
+            }
+        }
+    });
+}
+
+/// Resolve on Ctrl+C; saves a final snapshot before the server stops.
+async fn shutdown_signal(state: AppState, path: PathBuf) {
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("shutting down — saving state to {}", path.display());
+    if let Err(e) = write_snapshot(&path, &take_snapshot(&state)) {
+        tracing::warn!("final state flush failed: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,5 +795,55 @@ mod tests {
 
         let d = cache_key_of(&t, &req("bye", None));
         assert_ne!(a, d, "different content changes the key");
+    }
+
+    #[test]
+    fn snapshot_round_trips_metrics_and_cache() {
+        use aigate_core::Usage;
+
+        let s = AppState::default();
+        record(
+            &s,
+            "app1",
+            "openai",
+            "gpt-4o",
+            Some(&Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            }),
+        );
+        let resp = UnifiedResponse {
+            content: "hi".into(),
+            tool_calls: None,
+            model: "gpt-4o".into(),
+            finish_reason: Some("stop".into()),
+            usage: None,
+        };
+        cache_put(&s, "k1".into(), &resp, Duration::from_secs(300));
+        let _ = cache_get(&s, "absent"); // bump misses
+
+        // Serialize and restore into a fresh state.
+        let json = serde_json::to_vec(&take_snapshot(&s)).unwrap();
+        let restored: Snapshot = serde_json::from_slice(&json).unwrap();
+        let s2 = AppState::default();
+        apply_snapshot(&s2, restored);
+
+        let metrics = s2.metrics.lock().unwrap();
+        let stat = metrics
+            .entries
+            .get(&StatKey {
+                app: "app1".into(),
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+            })
+            .expect("metric restored");
+        assert_eq!(stat.requests, 1);
+        assert_eq!(stat.total_tokens, 15);
+        drop(metrics);
+
+        let cache = s2.cache.lock().unwrap();
+        assert!(cache.entries.contains_key("k1"), "cache entry restored");
+        assert_eq!(cache.misses, 1, "cache counters restored");
     }
 }
