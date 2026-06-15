@@ -48,7 +48,7 @@ type ApiError = (StatusCode, Json<Value>);
 struct AppState {
     metrics: Arc<Mutex<Metrics>>,
     cache: Arc<Mutex<Cache>>,
-    /// Valid gateway keys -> app name. Empty disables auth.
+    /// Valid AIGate keys -> app name. Empty disables auth.
     keys: Arc<HashMap<String, String>>,
     rate: Arc<Mutex<RateLimiter>>,
 }
@@ -144,9 +144,9 @@ async fn main() {
         ..Default::default()
     };
     if state.keys.is_empty() {
-        tracing::warn!("gateway auth DISABLED (set AIGATE_KEYS to require X-AIGate-Key)");
+        tracing::warn!("AIGate auth DISABLED (set AIGATE_KEYS to require X-AIGate-Key)");
     } else {
-        tracing::info!("gateway auth enabled: {} key(s)", state.keys.len());
+        tracing::info!("AIGate auth enabled: {} key(s)", state.keys.len());
     }
     if rpm == 0 {
         tracing::warn!("rate limiting DISABLED (set AIGATE_RATE_LIMIT to requests/min)");
@@ -173,7 +173,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .merge(protected)
-        // Permissive CORS so a browser test client can call the gateway.
+        // Permissive CORS so a browser test client can call AIGate.
         // Tighten the allowed origins for production.
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
@@ -459,7 +459,7 @@ async fn guard(
     Ok(next.run(req).await)
 }
 
-/// Authenticate the caller against the configured gateway keys.
+/// Authenticate the caller against the configured AIGate keys.
 /// - auth disabled (no keys) -> `Ok(None)` (caller falls back to `X-AI-App`)
 /// - valid `X-AIGate-Key`     -> `Ok(Some(app))` (trusted app identity)
 /// - missing/invalid key      -> `Err(401)`

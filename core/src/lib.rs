@@ -1,6 +1,6 @@
-//! AIGate core — provider-agnostic AI gateway.
+//! AIGate core — one API to multiple AI providers.
 //!
-//! The gateway speaks one wire format to apps (OpenAI-compatible) and
+//! AIGate speaks one wire format to apps (OpenAI-compatible) and
 //! translates to each upstream engine through the [`Provider`] trait.
 //! Credentials are never stored: the caller's API key is passed per request.
 

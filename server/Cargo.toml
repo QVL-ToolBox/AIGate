@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "AIGate HTTP daemon: an OpenAI-compatible gateway to any AI engine."
+description = "AIGate HTTP daemon: one OpenAI-compatible API to any AI engine."
 
 [dependencies]
 aigate-core = { path = "../core" }

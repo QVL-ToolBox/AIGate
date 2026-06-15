@@ -1,15 +1,15 @@
 # AIGate
 
-A provider-agnostic AI gateway, in Rust. Run one daemon, point any of your apps
-at it, and talk to **OpenAI, Gemini, Claude, or Mistral** through a single
-OpenAI-compatible API.
+AIGate is a single Rust service that sits between your apps and the AI providers:
+your apps call **AIGate**, and AIGate forwards each request to **OpenAI, Gemini,
+Claude, or Mistral**. One daemon, one OpenAI-compatible API for every engine.
 
 - **One wire format.** Apps speak the OpenAI chat API. Any existing SDK works by
   changing only its base URL.
-- **Any engine.** The gateway translates to each provider's native format behind
-  the scenes. Adding an engine = implementing one trait.
+- **Any engine.** AIGate translates to each provider's native format behind the
+  scenes. Adding an engine = implementing one trait.
 - **Stateless keys.** The caller's API key is forwarded per request and never
-  stored by the gateway.
+  stored by AIGate.
 
 ---
 
@@ -55,7 +55,7 @@ and examples for each item are in the sections further down.
 | `Content-Type: application/json` | POST           | Required for the chat endpoint.                                |
 | `Authorization: Bearer <key>`  | usually         | Provider API key; default key for every targeted engine.       |
 | `X-AI-Key-<Provider>: <key>`   | optional        | Per-engine provider key (e.g. `X-AI-Key-Claude`). Overrides the bearer for that engine — required for **cross-engine failover**. |
-| `X-AIGate-Key: <key>`          | if auth on      | Gateway key (separate from the provider key).                  |
+| `X-AIGate-Key: <key>`          | if auth on      | AIGate key (separate from the provider key).                   |
 | `X-AI-Provider: <name>`        | optional        | Engine to use when `model` has no `provider/` prefix.          |
 | `X-AI-App: <name>`             | optional        | App label for usage metrics (ignored when auth is on — the key decides the identity). |
 | `X-AI-Cache: on \| <seconds> \| off` | optional  | Enable the response cache and set its TTL (`on` = 300s).       |
@@ -69,7 +69,7 @@ non-streaming chat replies.
 
 | Var                 | Default             | Meaning                                            |
 |---------------------|---------------------|----------------------------------------------------|
-| `AIGATE_KEYS`       | unset (auth off)    | `key:app,key:app,…` — enables gateway auth.         |
+| `AIGATE_KEYS`       | unset (auth off)    | `key:app,key:app,…` — enables AIGate auth.          |
 | `AIGATE_RATE_LIMIT` | `0` (off)           | Requests/min per identity (token bucket).           |
 | `AIGATE_CACHE_MAX`  | `1000`              | Max cache entries (`0` = unbounded, LRU eviction).  |
 | `AIGATE_STATE_FILE` | `aigate-state.json` | Persistence path (`off`/`none` disables).           |
@@ -89,7 +89,7 @@ non-streaming chat replies.
 
 ### Using an existing OpenAI SDK
 
-Point any OpenAI client at the gateway and prefix the model:
+Point any OpenAI client at AIGate and prefix the model:
 
 ```python
 from openai import OpenAI
@@ -239,12 +239,13 @@ unpriced models still count tokens with `cost_usd` unchanged. Metrics **survive
 restarts** (see [Persistence](#persistence)). For streaming, usage is recorded
 from the final chunk that carries it (Claude streaming omits it).
 
-## Gateway authentication
+## Authentication
 
 By default AIGate is **open** (anyone who can reach it can use it). Set
-`AIGATE_KEYS` to require a gateway key on every `/v1/*` request (`/health` stays
-open). Keys are distinct from provider keys: the **gateway** key goes in
-`X-AIGate-Key`, the **provider** key stays in `Authorization: Bearer`.
+`AIGATE_KEYS` to require an AIGate key on every `/v1/*` request (`/health` stays
+open). AIGate keys are distinct from provider keys: the **AIGate** key (who may
+use this AIGate) goes in `X-AIGate-Key`, the **provider** key (your OpenAI/Gemini
+key) stays in `Authorization: Bearer`.
 
 ```bash
 # key:app pairs, comma-separated
@@ -364,7 +365,7 @@ header.
 - [x] **Multimodal image inputs** (base64 + remote URLs)
 - [x] **Response cache** (opt-in, non-streaming)
 - [x] **Persistence** of metrics & cache (JSON snapshot, survives restart)
-- [x] **Gateway authentication** (per-app keys via `X-AIGate-Key`)
+- [x] **Authentication** (per-app keys via `X-AIGate-Key`)
 - [x] **Rate limiting** per identity (token bucket, `AIGATE_RATE_LIMIT`)
 - [x] **Cache bound + LRU eviction** (`AIGATE_CACHE_MAX`)
 - [ ] Auto-fetch remote images to base64 for Gemini

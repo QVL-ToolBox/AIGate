@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "AIGate core: provider-agnostic AI gateway types and adapters."
+description = "AIGate core: provider-agnostic types and provider adapters."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
