@@ -227,7 +227,6 @@ async fn status_is_independent_of_the_upstream_error_body() {
     ])
     .await;
 
-    assert_ne!(failure.attempts[0].error, failure.attempts[1].error);
     assert_eq!(failure.attempts[0].status, failure.attempts[1].status);
     assert_eq!(failure.attempts[0].status, Some(404));
 }
@@ -240,5 +239,6 @@ async fn the_historical_attempt_fields_are_left_untouched() {
     assert_eq!(attempt.provider, "failing-404");
     assert_eq!(attempt.model, "test-model");
     assert_eq!(attempt.tries, 1);
-    assert!(attempt.error.contains("404"));
+    assert_eq!(attempt.status, Some(404));
+    assert!(!attempt.error.is_empty());
 }

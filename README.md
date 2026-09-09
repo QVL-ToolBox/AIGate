@@ -341,17 +341,24 @@ each provider's error and how many `tries` it took. For streaming, failover
 covers stream *establishment*; an error after the first bytes are sent surfaces
 as-is.
 
-Each attempt also carries `status`, the **upstream HTTP status code** returned by
-that engine — a bare integer, never any error text. It is `null` when the attempt
-failed without an upstream reply: transport error, stream error, empty response,
-or a capability the adapter doesn't support. Use it to classify a failure without
-parsing `error`.
+Each attempt that reached an engine also carries `status`, the **upstream HTTP
+status code** it answered with — a bare integer, never any error text. It is
+`null` when the attempt failed without an upstream reply: transport error, stream
+error, empty response, or a capability the adapter doesn't support. Use it to
+classify a failure without parsing `error`.
+
+The array mixes two shapes. Targets rejected before any call — unknown provider,
+missing `provider/` prefix, no key for that engine — are listed first as
+config-skip entries of the form `{ "target", "error" }`: they carry **no**
+`provider`, `model`, `tries` or `status`. Switch on the presence of `target` to
+tell the two apart.
 
 ```json
 {
   "error": {
     "message": "all providers failed",
     "attempts": [
+      { "target": "mistral/mistral-large-latest", "error": "no API key for 'mistral' (…)" },
       { "provider": "openai", "model": "gpt-4o-mini", "tries": 3, "status": 429, "error": "…" },
       { "provider": "claude", "model": "claude-sonnet-4-6", "tries": 1, "status": null, "error": "…" }
     ]
