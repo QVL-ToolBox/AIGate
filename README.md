@@ -29,8 +29,31 @@ Two crates:
 
 ```bash
 cargo run -p aigate-server
-# AIGate listening on http://0.0.0.0:8080
+# AIGate listening on http://127.0.0.1:8080
 ```
+
+AIGate binds **loopback only** by default. Set `AIGATE_BIND` to `<ip>:<port>` to
+change the listen address — a different port for a second instance, or
+`0.0.0.0:<port>` to accept connections from other hosts. Any non-loopback
+address — `0.0.0.0`, `::` or a single LAN IP — is logged as a warning at startup:
+
+```bash
+AIGATE_BIND=127.0.0.1:8090 cargo run -p aigate-server   # second local instance
+AIGATE_BIND=0.0.0.0:8080   cargo run -p aigate-server   # all interfaces
+```
+
+An unparsable `AIGATE_BIND`, or an address that cannot be bound, stops the
+daemon with an explicit error instead of falling back to another address. An
+empty or blank `AIGATE_BIND` uses the loopback default and says so with a
+warning, so the fallback never happens unnoticed.
+
+The value is always a **full socket address**, never a bare port: it follows the
+house `tcp_addr`/`ws_addr` convention, and `parse::<SocketAddr>()` requires both
+halves anyway. Demanding the address makes the *port set, address forgotten*
+failure mode impossible — with a port-only setting, an operator moves the daemon
+to another port believing the listener is now restricted, while the interface it
+answers on silently stays whatever the default was. Here the exposure is stated
+on every start, or it is loopback.
 
 ## Quick reference
 
@@ -69,6 +92,7 @@ non-streaming chat replies.
 
 | Var                 | Default             | Meaning                                            |
 |---------------------|---------------------|----------------------------------------------------|
+| `AIGATE_BIND`       | `127.0.0.1:8080`    | Listen address `<ip>:<port>`; loopback by default.  |
 | `AIGATE_KEYS`       | unset (auth off)    | `key:app,key:app,…` — enables AIGate auth.          |
 | `AIGATE_RATE_LIMIT` | `0` (off)           | Requests/min per identity (token bucket).           |
 | `AIGATE_CACHE_MAX`  | `1000`              | Max cache entries (`0` = unbounded, LRU eviction).  |
