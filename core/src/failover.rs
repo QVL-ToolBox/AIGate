@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use crate::error::RetryClass;
+use crate::error::{AiError, RetryClass};
 use crate::provider::{ChunkStream, Provider};
 use crate::types::{UnifiedRequest, UnifiedResponse};
 
@@ -56,6 +56,7 @@ pub struct Attempt {
     pub provider: String,
     pub model: String,
     pub tries: u32,
+    pub status: Option<u16>,
     pub error: String,
 }
 
@@ -202,11 +203,19 @@ pub async fn stream_failover_with(
     })
 }
 
-fn attempt(provider: &str, model: &str, tries: u32, err: &crate::error::AiError) -> Attempt {
+fn upstream_status(err: &AiError) -> Option<u16> {
+    match err {
+        AiError::Upstream { status, .. } => Some(*status),
+        _ => None,
+    }
+}
+
+fn attempt(provider: &str, model: &str, tries: u32, err: &AiError) -> Attempt {
     Attempt {
         provider: provider.to_string(),
         model: model.to_string(),
         tries,
+        status: upstream_status(err),
         error: err.to_string(),
     }
 }
