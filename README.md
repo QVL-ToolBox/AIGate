@@ -341,6 +341,24 @@ each provider's error and how many `tries` it took. For streaming, failover
 covers stream *establishment*; an error after the first bytes are sent surfaces
 as-is.
 
+Each attempt also carries `status`, the **upstream HTTP status code** returned by
+that engine — a bare integer, never any error text. It is `null` when the attempt
+failed without an upstream reply: transport error, stream error, empty response,
+or a capability the adapter doesn't support. Use it to classify a failure without
+parsing `error`.
+
+```json
+{
+  "error": {
+    "message": "all providers failed",
+    "attempts": [
+      { "provider": "openai", "model": "gpt-4o-mini", "tries": 3, "status": 429, "error": "…" },
+      { "provider": "claude", "model": "claude-sonnet-4-6", "tries": 1, "status": null, "error": "…" }
+    ]
+  }
+}
+```
+
 ## Retry policy
 
 Errors are classified to avoid both wasted retries and pointless failover:

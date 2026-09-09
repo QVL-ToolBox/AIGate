@@ -763,7 +763,7 @@ fn failover_error(fe: FailoverError, skipped: Vec<Value>) -> ApiError {
     };
     let mut attempts = skipped;
     attempts.extend(fe.attempts.into_iter().map(|a| {
-        json!({ "provider": a.provider, "model": a.model, "tries": a.tries, "error": a.error })
+        json!({ "provider": a.provider, "model": a.model, "tries": a.tries, "status": a.status, "error": a.error })
     }));
     (
         status,
