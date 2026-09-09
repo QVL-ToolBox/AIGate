@@ -167,6 +167,17 @@ fn map_tool_choice(choice: &Value) -> Value {
     json!({ "functionCallingConfig": cfg })
 }
 
+fn generation_config(req: &UnifiedRequest) -> Option<Value> {
+    let mut config = serde_json::Map::new();
+    if let Some(temperature) = req.temperature {
+        config.insert("temperature".into(), json!(temperature));
+    }
+    if let Some(max_tokens) = req.max_tokens {
+        config.insert("maxOutputTokens".into(), json!(max_tokens));
+    }
+    (!config.is_empty()).then_some(Value::Object(config))
+}
+
 impl Gemini {
     fn build(req: &UnifiedRequest) -> Value {
         // Map tool_call_id -> function name so tool results can name their call.
@@ -242,6 +253,9 @@ impl Gemini {
         body.insert("contents".into(), json!(contents));
         if let Some(sys) = system_instruction {
             body.insert("systemInstruction".into(), sys);
+        }
+        if let Some(config) = generation_config(req) {
+            body.insert("generationConfig".into(), config);
         }
         if let Some(tools) = &req.tools {
             let decls: Vec<Value> = tools
@@ -473,5 +487,59 @@ mod tests {
         let remote = image_part("https://x/y.png");
         assert_eq!(remote["fileData"]["mimeType"], "image/png");
         assert_eq!(remote["fileData"]["fileUri"], "https://x/y.png");
+    }
+
+    fn sampling_req(temperature: Option<f32>, max_tokens: Option<u32>) -> UnifiedRequest {
+        UnifiedRequest {
+            model: "gemini-2.0-flash".into(),
+            messages: Vec::new(),
+            temperature,
+            max_tokens,
+            stream: false,
+            tools: None,
+            tool_choice: None,
+        }
+    }
+
+    fn serialized_body(temperature: Option<f32>, max_tokens: Option<u32>) -> Value {
+        Gemini::build(&sampling_req(temperature, max_tokens))
+    }
+
+    #[test]
+    fn generation_config_carries_temperature_and_max_output_tokens() {
+        let body = serialized_body(Some(0.5), Some(256));
+
+        assert_eq!(body["generationConfig"]["temperature"], 0.5);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 256);
+    }
+
+    #[test]
+    fn generation_config_carries_temperature_alone_when_max_tokens_is_absent() {
+        let body = serialized_body(Some(0.75), None);
+
+        assert_eq!(body["generationConfig"]["temperature"], 0.75);
+        assert!(body["generationConfig"].get("maxOutputTokens").is_none());
+    }
+
+    #[test]
+    fn generation_config_carries_max_output_tokens_alone_when_temperature_is_absent() {
+        let body = serialized_body(None, Some(12));
+
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 12);
+        assert!(body["generationConfig"].get("temperature").is_none());
+    }
+
+    #[test]
+    fn no_generation_config_when_neither_temperature_nor_max_tokens() {
+        let body = serialized_body(None, None);
+
+        assert!(body.get("generationConfig").is_none());
+    }
+
+    #[test]
+    fn zero_temperature_is_forwarded_not_omitted() {
+        let body = serialized_body(Some(0.0), None);
+
+        assert_eq!(body["generationConfig"]["temperature"], 0.0);
     }
 }

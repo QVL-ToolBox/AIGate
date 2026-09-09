@@ -31,6 +31,8 @@ struct ChatReq {
     model: String,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<String>,
     messages: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +124,8 @@ enum BlockDelta {
     #[serde(other)]
     Other,
 }
+
+const DEFAULT_MAX_TOKENS: u32 = 1024;
 
 const CLAUDE_MODELS: &[&str] = &[
     "claude-opus-4-1",
@@ -237,8 +241,8 @@ impl Claude {
 
         ChatReq {
             model: req.model.clone(),
-            // Anthropic requires max_tokens; default to a sane value.
-            max_tokens: req.max_tokens.unwrap_or(1024),
+            max_tokens: req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            temperature: req.temperature,
             system,
             messages,
             tools,
@@ -462,5 +466,44 @@ mod tests {
         let remote = image_block("https://x/y.jpg");
         assert_eq!(remote["source"]["type"], "url");
         assert_eq!(remote["source"]["url"], "https://x/y.jpg");
+    }
+
+    fn sampling_req(temperature: Option<f32>, max_tokens: Option<u32>) -> UnifiedRequest {
+        UnifiedRequest {
+            temperature,
+            max_tokens,
+            ..req(vec![], None)
+        }
+    }
+
+    fn serialized_body(temperature: Option<f32>, max_tokens: Option<u32>) -> Value {
+        serde_json::to_value(Claude::build(&sampling_req(temperature, max_tokens), false))
+            .expect("chat request serializes")
+    }
+
+    #[test]
+    fn serialized_body_carries_the_requested_temperature() {
+        assert_eq!(serialized_body(Some(0.25), None)["temperature"], 0.25);
+    }
+
+    #[test]
+    fn boundary_temperatures_are_forwarded() {
+        assert_eq!(serialized_body(Some(0.0), None)["temperature"], 0.0);
+        assert_eq!(serialized_body(Some(1.0), None)["temperature"], 1.0);
+    }
+
+    #[test]
+    fn omitted_temperature_leaves_no_temperature_field() {
+        assert!(serialized_body(None, None).get("temperature").is_none());
+    }
+
+    #[test]
+    fn max_tokens_keeps_its_default_of_1024() {
+        assert_eq!(serialized_body(None, None)["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn max_tokens_forwards_the_requested_value() {
+        assert_eq!(serialized_body(None, Some(77))["max_tokens"], 77);
     }
 }
