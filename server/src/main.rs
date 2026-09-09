@@ -13,7 +13,9 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,6 +42,9 @@ use aigate_core::{
 };
 
 type ApiError = (StatusCode, Json<Value>);
+
+const BIND_ENV: &str = "AIGATE_BIND";
+const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
 
 // ── In-memory usage tracking ────────────────────────────────────────────
 // Ephemeral: aggregated per (app, provider, model); reset on restart.
@@ -122,13 +127,21 @@ struct Stat {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "aigate_server=info,tower_http=info".into()),
         )
         .init();
+
+    let bind = match load_bind_addr() {
+        Ok(addr) => addr,
+        Err(message) => {
+            tracing::error!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let rpm = load_rate_limit();
     let state = AppState {
@@ -178,18 +191,47 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    let addr = "0.0.0.0:8080";
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
-    tracing::info!("AIGate listening on http://{addr}");
+    let listener = match tokio::net::TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("cannot bind {bind} (set {BIND_ENV} to another address): {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!("AIGate listening on http://{bind}");
+    if bind.ip().is_unspecified() {
+        tracing::warn!(
+            "AIGate exposed on ALL interfaces ({bind}); set {BIND_ENV} to a loopback address to restrict it"
+        );
+    }
 
     let serve = axum::serve(listener, app);
-    match path {
-        Some(p) => serve
-            .with_graceful_shutdown(shutdown_signal(state, p))
-            .await
-            .expect("serve"),
-        None => serve.await.expect("serve"),
+    let outcome = match path {
+        Some(p) => {
+            serve
+                .with_graceful_shutdown(shutdown_signal(state, p))
+                .await
+        }
+        None => serve.await,
+    };
+    if let Err(e) = outcome {
+        tracing::error!("server stopped: {e}");
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
+}
+
+fn load_bind_addr() -> Result<SocketAddr, String> {
+    let Ok(raw) = std::env::var(BIND_ENV) else {
+        return Ok(DEFAULT_BIND);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(DEFAULT_BIND);
+    }
+    raw.parse().map_err(|_| {
+        format!("invalid {BIND_ENV}=\"{raw}\": expected <ip>:<port>, e.g. 127.0.0.1:8080")
+    })
 }
 
 /// `GET /v1/models` — OpenAI-compatible model listing aggregated across
