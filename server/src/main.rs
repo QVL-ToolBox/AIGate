@@ -199,9 +199,9 @@ async fn main() -> ExitCode {
         }
     };
     tracing::info!("AIGate listening on http://{bind}");
-    if bind.ip().is_unspecified() {
+    if !bind.ip().is_loopback() {
         tracing::warn!(
-            "AIGate exposed on ALL interfaces ({bind}); set {BIND_ENV} to a loopback address to restrict it"
+            "AIGate reachable from other hosts ({bind}); set {BIND_ENV} to a loopback address"
         );
     }
 
@@ -227,6 +227,7 @@ fn load_bind_addr() -> Result<SocketAddr, String> {
     };
     let raw = raw.trim();
     if raw.is_empty() {
+        tracing::warn!("{BIND_ENV} is set but empty; using the default {DEFAULT_BIND}");
         return Ok(DEFAULT_BIND);
     }
     raw.parse().map_err(|_| {

@@ -34,7 +34,8 @@ cargo run -p aigate-server
 
 AIGate binds **loopback only** by default. Set `AIGATE_BIND` to `<ip>:<port>` to
 change the listen address — a different port for a second instance, or
-`0.0.0.0:<port>` to accept connections from other hosts (logged as a warning):
+`0.0.0.0:<port>` to accept connections from other hosts. Any non-loopback
+address — `0.0.0.0`, `::` or a single LAN IP — is logged as a warning at startup:
 
 ```bash
 AIGATE_BIND=127.0.0.1:8090 cargo run -p aigate-server   # second local instance
@@ -42,7 +43,9 @@ AIGATE_BIND=0.0.0.0:8080   cargo run -p aigate-server   # all interfaces
 ```
 
 An unparsable `AIGATE_BIND`, or an address that cannot be bound, stops the
-daemon with an explicit error instead of falling back to another address.
+daemon with an explicit error instead of falling back to another address. An
+empty or blank `AIGATE_BIND` uses the loopback default and says so with a
+warning, so the fallback never happens unnoticed.
 
 The value is always a **full socket address**, never a bare port: it follows the
 house `tcp_addr`/`ws_addr` convention, and `parse::<SocketAddr>()` requires both
