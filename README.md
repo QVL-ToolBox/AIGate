@@ -2,7 +2,8 @@
 
 AIGate is a single Rust service that sits between your apps and the AI providers:
 your apps call **AIGate**, and AIGate forwards each request to **OpenAI, Gemini,
-Claude, or Mistral**. One daemon, one OpenAI-compatible API for every engine.
+Claude, Mistral, or a local Ollama**. One daemon, one OpenAI-compatible API for
+every engine.
 
 - **One wire format.** Apps speak the OpenAI chat API. Any existing SDK works by
   changing only its base URL.
@@ -16,7 +17,7 @@ Claude, or Mistral**. One daemon, one OpenAI-compatible API for every engine.
 ## Architecture
 
 ```
-your app ──(OpenAI-format HTTP)──▶  AIGate daemon  ──▶  OpenAI / Gemini / Claude / Mistral
+your app ──(OpenAI-format HTTP)──▶  AIGate daemon  ──▶  OpenAI / Gemini / Claude / Mistral / Ollama
 ```
 
 Two crates:
@@ -90,21 +91,23 @@ non-streaming chat replies.
 
 ### Environment variables (all optional)
 
-| Var                 | Default             | Meaning                                            |
-|---------------------|---------------------|----------------------------------------------------|
-| `AIGATE_BIND`       | `127.0.0.1:8080`    | Listen address `<ip>:<port>`; loopback by default.  |
-| `AIGATE_KEYS`       | unset (auth off)    | `key:app,key:app,…` — enables AIGate auth.          |
-| `AIGATE_RATE_LIMIT` | `0` (off)           | Requests/min per identity (token bucket).           |
-| `AIGATE_CACHE_MAX`  | `1000`              | Max cache entries (`0` = unbounded, LRU eviction).  |
-| `AIGATE_STATE_FILE` | `aigate-state.json` | Persistence path (`off`/`none` disables).           |
-| `AIGATE_FLUSH_SECS` | `15`                | Persistence flush interval (seconds).               |
-| `RUST_LOG`          | `aigate_server=info`| Tracing filter.                                     |
+| Var                      | Default                     | Meaning                                            |
+|--------------------------|-----------------------------|----------------------------------------------------|
+| `AIGATE_BIND`            | `127.0.0.1:8080`            | Listen address `<ip>:<port>`; loopback by default.  |
+| `AIGATE_OLLAMA_BASE_URL` | `http://127.0.0.1:11434/v1` | Ollama API base URL; loopback by default.           |
+| `AIGATE_KEYS`            | unset (auth off)            | `key:app,key:app,…` — enables AIGate auth.          |
+| `AIGATE_RATE_LIMIT`      | `0` (off)                   | Requests/min per identity (token bucket).           |
+| `AIGATE_CACHE_MAX`       | `1000`                      | Max cache entries (`0` = unbounded, LRU eviction).  |
+| `AIGATE_STATE_FILE`      | `aigate-state.json`         | Persistence path (`off`/`none` disables).           |
+| `AIGATE_FLUSH_SECS`      | `15`                        | Persistence flush interval (seconds).               |
+| `RUST_LOG`               | `aigate_server=info`        | Tracing filter.                                     |
 
 ### Model id & request body
 
 - **Model id**: `provider/model`, e.g. `openai/gpt-4o-mini`,
   `gemini/gemini-2.0-flash`, `claude/claude-sonnet-4-5`,
-  `mistral/mistral-small-latest`. Aliases: `anthropic/`→claude, `google/`→gemini.
+  `mistral/mistral-small-latest`, `ollama/<local-model>`. Aliases:
+  `anthropic/`→claude, `google/`→gemini.
 - **Body** is the OpenAI chat-completions schema plus one extension:
   `model`, `messages`, `stream`, `temperature`, `max_tokens`, `tools`,
   `tool_choice`, and **`fallbacks`** (array of `provider/model`, AIGate-specific).
@@ -324,6 +327,47 @@ may lose up to one flush interval.
 | Mistral  | `mistral/`          | `Authorization: Bearer`      |
 | Claude   | `claude/`, `anthropic/` | `x-api-key` (handled internally) |
 | Gemini   | `gemini/`, `google/`    | API key query param (handled internally) |
+| Ollama   | `ollama/`           | none — send any bearer (see below) |
+
+### Ollama (local models)
+
+Ollama exposes an OpenAI-compatible API, so it is served by the same adapter as
+OpenAI and Mistral — only the base URL differs. Model ids are Ollama tags,
+prefix included: `ollama/qwen2.5:3b-instruct-q4_K_M`.
+
+Unlike the hosted engines, the Ollama endpoint is **configurable**, because it
+is a local service whose port is an operator's choice:
+
+```bash
+AIGATE_OLLAMA_BASE_URL=http://127.0.0.1:11435/v1 cargo run -p aigate-server
+```
+
+The default is `http://127.0.0.1:11434/v1` — an Ollama on the **same host**,
+listening on loopback. Point it elsewhere and you leave the loopback path:
+Ollama itself must then accept non-local connections, which is a decision to
+make deliberately. There is no fallback here: a value that is not an `http(s)`
+URL — including one carrying a query, a fragment or credentials — or that is set
+but empty, stops the daemon with an explicit error instead of quietly reverting
+to the default. This is stricter than `AIGATE_BIND`, which warns and falls back
+on an empty value — `core` has no logger to announce a fallback with, so the
+fallback was removed rather than left silent. The resolved base URL is logged at
+startup.
+
+Ollama needs no credentials but AIGate requires a key per targeted engine, so
+send any non-empty bearer — it is forwarded and ignored upstream:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer local" -H "Content-Type: application/json" \
+  -d '{ "model": "ollama/qwen2.5:3b-instruct-q4_K_M",
+        "messages": [{ "role": "user", "content": "Hello in one word" }] }'
+```
+
+`temperature` and `max_tokens` are forwarded like on any OpenAI-compatible
+engine, and streaming asks for usage so tokens are counted. Local models are
+unpriced: `/v1/usage` counts their tokens with `cost_usd` unchanged. Without a
+key, `/v1/models` returns the built-in fallback catalog; with one, it lists the
+models actually installed on that host.
 
 ## Streaming
 
@@ -405,12 +449,13 @@ header.
 
 ## Roadmap
 
-- [x] **Streaming** (SSE token-by-token) across all four engines
+- [x] **Streaming** (SSE token-by-token) across all five engines
 - [x] **Provider failover / fallback** with per-engine keys
 - [x] **Smart retry policy** (transient retry + backoff, abort on client errors)
 - [x] **`/v1/models`** listing (live with key, built-in catalog without)
 - [x] **Token & cost tracking** per app (`/v1/usage`, in-memory)
-- [x] **Tool calling** across all four engines (non-streaming and streaming)
+- [x] **Tool calling** across all five engines (non-streaming and streaming;
+      model-dependent on Ollama)
 - [x] **Multimodal image inputs** (base64 + remote URLs)
 - [x] **Response cache** (opt-in, non-streaming)
 - [x] **Persistence** of metrics & cache (JSON snapshot, survives restart)

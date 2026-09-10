@@ -6,16 +6,23 @@ mod openai;
 
 use crate::provider::Provider;
 
-/// Canonical provider names, in a stable order (aliases excluded).
-pub const PROVIDERS: &[&str] = &["openai", "mistral", "claude", "gemini"];
+pub use openai::ollama_base_url;
 
-/// Resolve a provider name into its adapter. Aliases are accepted.
+/// Canonical provider names, in a stable order (aliases excluded).
+pub const PROVIDERS: &[&str] = &["openai", "mistral", "claude", "gemini", "ollama"];
+
+/// Resolve a provider name into its adapter. Aliases are accepted. `ollama`
+/// also yields `None` when `AIGATE_OLLAMA_BASE_URL` holds an invalid value, so
+/// no request can reach an endpoint the operator did not ask for.
 pub fn resolve(name: &str) -> Option<Box<dyn Provider>> {
     match name.to_ascii_lowercase().as_str() {
         "openai" => Some(Box::new(openai::openai())),
         "mistral" => Some(Box::new(openai::mistral())),
         "claude" | "anthropic" => Some(Box::new(claude::Claude::new())),
         "gemini" | "google" => Some(Box::new(gemini::Gemini::new())),
+        "ollama" => ollama_base_url()
+            .ok()
+            .map(|base| Box::new(openai::ollama(base)) as Box<dyn Provider>),
         _ => None,
     }
 }
@@ -68,7 +75,13 @@ mod tests {
     #[test]
     fn every_listed_provider_resolves_with_a_catalog() {
         for &name in PROVIDERS {
-            let provider = resolve(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            let provider = resolve(name).unwrap_or_else(|| {
+                panic!(
+                    "{name} should resolve; a provider reading its configuration from the \
+                     environment fails here when that value is invalid: {:?}",
+                    openai::ollama_base_url().err()
+                )
+            });
             assert_eq!(provider.name(), name, "canonical name mismatch for {name}");
             assert!(!provider.catalog().is_empty(), "{name} has an empty catalog");
         }
