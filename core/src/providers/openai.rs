@@ -1,6 +1,3 @@
-//! OpenAI-compatible adapter. OpenAI and Mistral share the exact same wire
-//! format, so one implementation backs both — only the base URL differs.
-
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
@@ -30,6 +27,10 @@ const MISTRAL_MODELS: &[&str] = &[
     "mistral-small-latest",
     "open-mistral-nemo",
 ];
+const OLLAMA_MODELS: &[&str] = &["qwen2.5:3b-instruct-q4_K_M", "llama3.2:3b-instruct-q4_K_M"];
+
+const OLLAMA_BASE_ENV: &str = "AIGATE_OLLAMA_BASE_URL";
+const DEFAULT_OLLAMA_BASE: &str = "http://127.0.0.1:11434/v1";
 
 pub fn openai() -> OpenAiCompatible {
     OpenAiCompatible {
@@ -49,6 +50,49 @@ pub fn mistral() -> OpenAiCompatible {
         stream_usage: false,
         catalog: MISTRAL_MODELS,
     }
+}
+
+pub fn ollama(base: String) -> OpenAiCompatible {
+    OpenAiCompatible {
+        client: super::shared_client(),
+        base,
+        name: "ollama",
+        stream_usage: true,
+        catalog: OLLAMA_MODELS,
+    }
+}
+
+pub fn ollama_base_url() -> Result<String, String> {
+    parse_ollama_base(std::env::var(OLLAMA_BASE_ENV).ok().as_deref())
+}
+
+fn parse_ollama_base(raw: Option<&str>) -> Result<String, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_OLLAMA_BASE.to_string());
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(format!(
+            "{OLLAMA_BASE_ENV} is set but empty: unset it to use the default {DEFAULT_OLLAMA_BASE}"
+        ));
+    }
+    match reqwest::Url::parse(raw) {
+        Ok(url) if is_bare_http_endpoint(&url) => {
+            Ok(url.as_str().trim_end_matches('/').to_string())
+        }
+        _ => Err(format!(
+            "invalid {OLLAMA_BASE_ENV}=\"{raw}\": expected an http(s) URL with no query \
+             or fragment, e.g. {DEFAULT_OLLAMA_BASE}"
+        )),
+    }
+}
+
+fn is_bare_http_endpoint(url: &reqwest::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 fn is_false(b: &bool) -> bool {
@@ -300,6 +344,162 @@ impl Provider for OpenAiCompatible {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accepted(raw: &str) -> String {
+        parse_ollama_base(Some(raw)).expect("a usable ollama base url")
+    }
+
+    fn rejection_of(raw: &str) -> String {
+        parse_ollama_base(Some(raw)).expect_err("a rejected ollama base url")
+    }
+
+    #[test]
+    fn an_unset_variable_uses_the_loopback_default() {
+        assert_eq!(parse_ollama_base(None).unwrap(), DEFAULT_OLLAMA_BASE);
+    }
+
+    #[test]
+    fn an_empty_or_blank_value_is_rejected_rather_than_silently_defaulted() {
+        for raw in ["", " ", "\t", " \n "] {
+            let message = rejection_of(raw);
+            assert!(message.contains(OLLAMA_BASE_ENV), "{raw:?} -> {message}");
+            assert!(message.contains("set but empty"), "{raw:?} -> {message}");
+            assert!(
+                message.contains(DEFAULT_OLLAMA_BASE),
+                "{raw:?} -> {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_url_is_rejected() {
+        for raw in [
+            "pas-une-url",
+            "127.0.0.1:11434/v1",
+            "//127.0.0.1:11434/v1",
+            "http://",
+        ] {
+            assert!(
+                rejection_of(raw).contains(OLLAMA_BASE_ENV),
+                "{raw:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_http_scheme_is_rejected() {
+        for raw in [
+            "ftp://127.0.0.1:11434/v1",
+            "file:///tmp/models",
+            "ws://127.0.0.1:11434/v1",
+            "wss://127.0.0.1:11434/v1",
+        ] {
+            assert!(
+                rejection_of(raw).contains(OLLAMA_BASE_ENV),
+                "{raw:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_query_a_fragment_or_credentials_are_rejected() {
+        for raw in [
+            "http://127.0.0.1:11434/v1?debug=1",
+            "http://127.0.0.1:11434/v1?",
+            "http://127.0.0.1:11434/v1#frag",
+            "http://127.0.0.1:11434/v1#",
+            "http://user:pass@127.0.0.1:11434/v1",
+            "http://user@127.0.0.1:11434/v1",
+        ] {
+            assert!(
+                rejection_of(raw).contains(OLLAMA_BASE_ENV),
+                "{raw:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_absorbed_from_the_path_is_revealed_by_normalisation() {
+        assert_eq!(accepted("http:///v1"), "http://v1");
+        assert_eq!(accepted("http:////v1"), "http://v1");
+        assert_eq!(accepted("http://./v1"), "http://./v1");
+    }
+
+    #[test]
+    fn the_accepted_value_is_the_validated_url_not_the_raw_input() {
+        assert_eq!(
+            accepted("http://LOCALHOST:11434/v1"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(accepted("http://localhost:80/v1"), "http://localhost/v1");
+        assert_eq!(accepted("https://localhost:443/v1"), "https://localhost/v1");
+        assert_eq!(
+            accepted("http://127.0.0.1:11434/mon chemin/v1"),
+            "http://127.0.0.1:11434/mon%20chemin/v1"
+        );
+    }
+
+    #[test]
+    fn an_accepted_base_never_lets_the_request_path_be_swallowed() {
+        let base = accepted("http://127.0.0.1:11434/v1");
+        assert_eq!(
+            format!("{base}/chat/completions"),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn a_valid_endpoint_loses_its_trailing_slashes() {
+        assert_eq!(
+            accepted("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            accepted("http://127.0.0.1:11434/v1/"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            accepted("http://127.0.0.1:11434/v1//"),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            accepted("http://127.0.0.1:11434/"),
+            "http://127.0.0.1:11434"
+        );
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        assert_eq!(
+            accepted("  http://127.0.0.1:11434/v1  "),
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            accepted("\thttp://127.0.0.1:11434/v1\n"),
+            "http://127.0.0.1:11434/v1"
+        );
+    }
+
+    #[test]
+    fn https_and_alternative_hosts_are_accepted() {
+        assert_eq!(
+            accepted("https://127.0.0.1:11434/v1"),
+            "https://127.0.0.1:11434/v1"
+        );
+        assert_eq!(
+            accepted("http://localhost:11434/v1"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(accepted("http://[::1]:11434/v1"), "http://[::1]:11434/v1");
+        assert_eq!(accepted("http://127.0.0.1:11434"), "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn the_configured_endpoint_reaches_the_provider() {
+        let provider = ollama(accepted("http://127.0.0.1:11435/v1/"));
+        assert_eq!(provider.name(), "ollama");
+        assert!(!provider.catalog().is_empty());
+    }
 
     #[test]
     fn stream_tool_call_delta_maps() {

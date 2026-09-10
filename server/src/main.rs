@@ -36,8 +36,8 @@ use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
 use aigate_core::{
-    chat_failover_with, estimate_cost, resolve, split_model, stream_failover_with, Chunk,
-    ChunkStream, FailoverError, RetryPolicy, Target, UnifiedRequest, UnifiedResponse, Usage,
+    chat_failover_with, estimate_cost, ollama_base_url, resolve, split_model, stream_failover_with,
+    Chunk, ChunkStream, FailoverError, RetryPolicy, Target, UnifiedRequest, UnifiedResponse, Usage,
     PROVIDERS,
 };
 
@@ -142,6 +142,14 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    match ollama_base_url() {
+        Ok(base) => tracing::info!("Ollama base URL: {base}"),
+        Err(message) => {
+            tracing::error!("{message}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     let rpm = load_rate_limit();
     let state = AppState {
